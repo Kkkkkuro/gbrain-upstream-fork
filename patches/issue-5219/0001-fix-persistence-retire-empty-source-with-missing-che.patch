@@ -1,0 +1,341 @@
+From c8e37aedc1c84c6de4e31cf232d9e7cf0e81833c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 2 Oct 2026 13:00:04 +0000
+Subject: [PATCH] fix(persistence): retire empty source with missing checkout
+ (#5219)
+
+Allow sources archive|remove --retire-missing-checkout when the canonical
+checkout is already gone and the source has zero live pages, zero
+soft-deleted pages, zero chunks, and no pending mirrors. Populated
+sources, physical-identity stubs, and other lifecycle verbs stay closed.
+
+Co-authored-by: Kkkkkuro <Kkkkkuro@users.noreply.github.com>
+---
+ src/commands/sources-lifecycle-args.ts    |  7 +-
+ src/commands/sources-lifecycle.ts         |  9 ++-
+ src/core/cli-flag-registry.generated.ts   |  4 +-
+ src/core/persistence/administration.ts    |  6 +-
+ src/core/persistence/source-lifecycle.ts  | 47 ++++++++++-
+ test/persistence-source-lifecycle.test.ts | 96 ++++++++++++++++++++++-
+ 6 files changed, 156 insertions(+), 13 deletions(-)
+
+diff --git a/src/commands/sources-lifecycle-args.ts b/src/commands/sources-lifecycle-args.ts
+index 88a0a669a..5d8a8497d 100644
+--- a/src/commands/sources-lifecycle-args.ts
++++ b/src/commands/sources-lifecycle-args.ts
+@@ -31,7 +31,7 @@ export function parseSourceLifecycleArgs(args: string[], generatedId = randomUUI
+   const flags = new Set<string>();
+   const positionals: string[] = [];
+   const booleans = new Set(['json', 'dry-run', 'yes', 'confirm-destructive', 'keep-storage', 'force',
+-    'federated', 'no-federated', 'no-federate', 'refederate', 'no-harden']);
++    'federated', 'no-federated', 'no-federate', 'refederate', 'no-harden', 'retire-missing-checkout']);
+   const valued = new Set(['request-id', 'expected-incarnation', 'brain', 'path', 'url', 'name', 'clone-dir',
+     'pat-file', 'kind', 'account', 'access', 'token-command', 'token-env', 'services', 'history-days',
+     'calendar-id', 'scope', 'repos', 'dir', 'app-id', 'app-pem', 'app-install']);
+@@ -67,7 +67,8 @@ export function parseSourceLifecycleArgs(args: string[], generatedId = randomUUI
+   const allowed = verb === 'add' ? new Set([...common, ...valued, 'federated', 'no-federated', 'force', 'no-harden'])
+     : new Set([...common, ...(verb === 'set-path' ? ['path', 'force'] : []),
+       ...(['remove', 'purge'].includes(verb) ? ['yes', 'confirm-destructive', 'keep-storage'] : []),
+-      ...(verb === 'restore' ? ['no-federate', 'refederate'] : [])]);
++      ...(verb === 'restore' ? ['no-federate', 'refederate'] : []),
++      ...(['archive', 'remove'].includes(verb) ? ['retire-missing-checkout'] : [])]);
+   for (const key of [...values.keys(), ...flags]) if (!allowed.has(key)) throw invalid(`--${key} does not apply to sources ${verb}.`);
+   if (verb === 'set-path') {
+     if (positionals.length && values.has('path')) throw invalid('Specify the set-path target once.');
+@@ -84,8 +85,8 @@ export function parseSourceLifecycleArgs(args: string[], generatedId = randomUUI
+     // --yes must never bypass the populated-source destructive confirmation.
+     params.confirm_destructive = flags.has('confirm-destructive');
+   }
++  if (flags.has('retire-missing-checkout')) params.retire_missing_checkout = true;
+   if (verb !== 'add') return { operation: 'source_lifecycle', params, brain: values.get('brain'), legacyOnly: false, json: flags.has('json') };
+-
+   if (flags.has('federated') && flags.has('no-federated')) throw invalid('Choose one federation setting.');
+   const kind = values.get('kind');
+   if (kind !== undefined && !['google', 'github'].includes(kind)) throw invalid('Source kind must be github or google.');
+diff --git a/src/commands/sources-lifecycle.ts b/src/commands/sources-lifecycle.ts
+index a5dbc0844..75e73a9ee 100644
+--- a/src/commands/sources-lifecycle.ts
++++ b/src/commands/sources-lifecycle.ts
+@@ -15,9 +15,9 @@ import { reportPersistenceCliError } from './persistence-delegate.ts';
+ 
+ export const SOURCE_LIFECYCLE_HELP = `Managed source administration:
+   gbrain sources add <id> [--path <directory> | --url <https-url> | --kind github|google]
+-  gbrain sources archive <id>
++  gbrain sources archive <id> [--retire-missing-checkout]
+   gbrain sources restore <id> [--no-federate]
+-  gbrain sources remove <id> --confirm-destructive
++  gbrain sources remove <id> --confirm-destructive [--retire-missing-checkout]
+   gbrain sources purge <archived-id> --confirm-destructive
+   gbrain sources set-path <id> <verified-directory>
+   gbrain sources set-path <id> --clear   (connector sources: clear a stale local_path)
+@@ -27,7 +27,10 @@ All commands accept --request-id <uuid>, --expected-incarnation <uuid>, --dry-ru
+ --brain <id>, and --json. Retain the returned request ID across retries. Rebind
+ requires an exact canonical manifest, including deletions; --force cannot bypass
+ ownership. Remove and purge retain local storage for explicit operator cleanup.
+-Unmanaged installations retain their existing source command behavior.`;
++--retire-missing-checkout applies only to archive/remove of a source with zero
++live pages, zero soft-deleted pages, and zero chunks when the canonical checkout
++directory is already gone; it never skips physical-identity or populated-source
++guards. Unmanaged installations retain their existing source command behavior.`;
+ 
+ function checkManagedOptions(parsed: ParsedSourceLifecycle): void {
+   if (parsed.legacyOnly) throw new OperationError('writer_coordinator_required',
+diff --git a/src/core/cli-flag-registry.generated.ts b/src/core/cli-flag-registry.generated.ts
+index e23f26d2e..bcf43fd3f 100644
+--- a/src/core/cli-flag-registry.generated.ts
++++ b/src/core/cli-flag-registry.generated.ts
+@@ -99,7 +99,7 @@ export const CLI_FLAG_REGISTRY: Record<string, readonly string[]> = {
+   'repair': ['--all', '--apply', '--brain', '--help', '--include-repairs', '--json', '--limit', '--max-cost', '--max-usd', '--no-embed', '--remediate', '--source', '--stale', '--yes'],
+   'repair-jsonb': ['--background', '--brain', '--dry-run', '--explain', '--follow', '--help', '--json', '--progress-interval', '--progress-json', '--quiet', '--source', '--supabase', '--timeout', '--url'],
+   'report': ['--brain', '--content', '--dir', '--help', '--json', '--source', '--title', '--type'],
+-  'repos': ['--abbrev-ref', '--abort', '--access', '--account', '--admin-intent', '--after', '--all', '--allow-unverified-remote', '--allowed-operations', '--app-id', '--app-install', '--app-pem', '--apply', '--audit', '--backups', '--before', '--bound-brain', '--bound-max-concurrent', '--bound-slug-prefixes', '--bound-source', '--bound-tools', '--brain', '--branch', '--budget-usd-per-day', '--cached', '--calendar-id', '--cleanup-dead-local-locks', '--clear', '--clone-dir', '--confirm-destructive', '--confirm-quiesced', '--count', '--days', '--decisions', '--delegated-namespace', '--delegated-slug-prefixes', '--detect', '--diff-filter', '--dir', '--dry-run', '--exclude', '--exclude-standard', '--exit-code', '--expected-epoch', '--expected-incarnation', '--expected-state', '--federated', '--federated-read', '--file', '--fix', '--force', '--format', '--from', '--get', '--get-url', '--git-dir', '--git-path', '--github-repo', '--grant-types', '--help', '--history-days', '--http', '--id', '--include', '--include-warns', '--is-ancestor', '--is-inside-work-tree', '--json', '--keep-storage', '--kind', '--limit', '--local', '--manifest', '--max-cost-usd', '--message', '--name', '--name-only', '--no-cron', '--no-embed', '--no-federate', '--no-federated', '--no-harden', '--no-pull', '--no-tags', '--no-verify', '--no-write-fetch-head', '--others', '--out', '--params', '--pat-file', '--path', '--plan', '--preview', '--probe', '--profile', '--push', '--push-only', '--quiet', '--rebase', '--redirect-uri', '--remove-backup', '--repair', '--replace', '--repos', '--request-id', '--reset-checkpoint', '--retry-failed', '--scope', '--scopes', '--secret', '--self-transfer', '--services', '--set', '--shared-skills', '--short', '--show-toplevel', '--slug-prefixes', '--source', '--source-id', '--source-ids', '--stale', '--status', '--surface', '--takes-holders', '--token', '--token-command', '--token-endpoint-auth-method', '--token-env', '--token-ttl', '--unset-all', '--url', '--usage', '--yes'],
++  'repos': ['--abbrev-ref', '--abort', '--access', '--account', '--admin-intent', '--after', '--all', '--allow-unverified-remote', '--allowed-operations', '--app-id', '--app-install', '--app-pem', '--apply', '--audit', '--backups', '--before', '--bound-brain', '--bound-max-concurrent', '--bound-slug-prefixes', '--bound-source', '--bound-tools', '--brain', '--branch', '--budget-usd-per-day', '--cached', '--calendar-id', '--cleanup-dead-local-locks', '--clear', '--clone-dir', '--confirm-destructive', '--confirm-quiesced', '--count', '--days', '--decisions', '--delegated-namespace', '--delegated-slug-prefixes', '--detect', '--diff-filter', '--dir', '--dry-run', '--exclude', '--exclude-standard', '--exit-code', '--expected-epoch', '--expected-incarnation', '--expected-state', '--federated', '--federated-read', '--file', '--fix', '--force', '--format', '--from', '--get', '--get-url', '--git-dir', '--git-path', '--github-repo', '--grant-types', '--help', '--history-days', '--http', '--id', '--include', '--include-warns', '--is-ancestor', '--is-inside-work-tree', '--json', '--keep-storage', '--kind', '--limit', '--local', '--manifest', '--max-cost-usd', '--message', '--name', '--name-only', '--no-cron', '--no-embed', '--no-federate', '--no-federated', '--no-harden', '--no-pull', '--no-tags', '--no-verify', '--no-write-fetch-head', '--others', '--out', '--params', '--pat-file', '--path', '--plan', '--preview', '--probe', '--profile', '--push', '--push-only', '--quiet', '--rebase', '--redirect-uri', '--remove-backup', '--repair', '--replace', '--repos', '--request-id', '--reset-checkpoint', '--retire-missing-checkout', '--retry-failed', '--scope', '--scopes', '--secret', '--self-transfer', '--services', '--set', '--shared-skills', '--short', '--show-toplevel', '--slug-prefixes', '--source', '--source-id', '--source-ids', '--stale', '--status', '--surface', '--takes-holders', '--token', '--token-command', '--token-endpoint-auth-method', '--token-env', '--token-ttl', '--unset-all', '--url', '--usage', '--yes'],
+   'resolvers': ['--backend', '--brain', '--cost', '--help', '--json', '--source'],
+   'retrieval-upgrade': ['--all', '--background', '--batch-size', '--brain', '--catch-up', '--dim', '--dry-run', '--embedding-dimensions', '--embedding-model', '--explain', '--facts', '--follow', '--force', '--help', '--ignore-env-override', '--images', '--include-null-signature', '--json', '--max-cost-usd', '--no-embed', '--non-interactive', '--pace', '--pace-max-concurrency', '--priority', '--progress-interval', '--progress-json', '--quiet', '--reranker', '--retarget', '--slugs', '--source', '--stale', '--status', '--timeout', '--to', '--yes'],
+   'routing-eval': ['--brain', '--help', '--json', '--llm', '--skills-dir', '--source'],
+@@ -112,7 +112,7 @@ export const CLI_FLAG_REGISTRY: Record<string, readonly string[]> = {
+   'skillpack': ['--all', '--apply-clean-hunks', '--author', '--auto', '--brain', '--dest', '--dry-run', '--env', '--exit-code', '--fast', '--fix', '--force-unlock', '--format', '--from', '--full', '--harness', '--help', '--homepage', '--json', '--license', '--list', '--minimal', '--name-only', '--no-cache', '--no-lint', '--note', '--out', '--overwrite-local', '--persona', '--pure', '--push', '--quick', '--quiet', '--refresh', '--repo', '--schema-pack', '--scope', '--short', '--since', '--skill', '--skills', '--skills-dir', '--skip-doctor', '--source', '--strict', '--stub', '--supabase', '--target', '--tier', '--trust', '--url', '--verify', '--workspace', '--yes'],
+   'skillpack-check': ['--background', '--brain', '--explain', '--fast', '--follow', '--help', '--json', '--list', '--progress-interval', '--progress-json', '--quiet', '--source', '--strict', '--timeout', '--yes'],
+   'smoke-test': ['--brain', '--help', '--json', '--source'],
+-  'sources': ['--abbrev-ref', '--abort', '--access', '--account', '--admin-intent', '--after', '--all', '--allow-unverified-remote', '--allowed-operations', '--app-id', '--app-install', '--app-pem', '--apply', '--audit', '--backups', '--before', '--bound-brain', '--bound-max-concurrent', '--bound-slug-prefixes', '--bound-source', '--bound-tools', '--brain', '--branch', '--budget-usd-per-day', '--cached', '--calendar-id', '--cleanup-dead-local-locks', '--clear', '--clone-dir', '--confirm-destructive', '--confirm-quiesced', '--count', '--days', '--decisions', '--delegated-namespace', '--delegated-slug-prefixes', '--detect', '--diff-filter', '--dir', '--dry-run', '--exclude', '--exclude-standard', '--exit-code', '--expected-epoch', '--expected-incarnation', '--expected-state', '--federated', '--federated-read', '--file', '--fix', '--force', '--format', '--from', '--get', '--get-url', '--git-dir', '--git-path', '--github-repo', '--grant-types', '--help', '--history-days', '--http', '--id', '--include', '--include-warns', '--is-ancestor', '--is-inside-work-tree', '--json', '--keep-storage', '--kind', '--limit', '--local', '--manifest', '--max-cost-usd', '--message', '--name', '--name-only', '--no-cron', '--no-embed', '--no-federate', '--no-federated', '--no-harden', '--no-pull', '--no-tags', '--no-verify', '--no-write-fetch-head', '--others', '--out', '--params', '--pat-file', '--path', '--plan', '--preview', '--probe', '--profile', '--push', '--push-only', '--quiet', '--rebase', '--redirect-uri', '--remove-backup', '--repair', '--replace', '--repos', '--request-id', '--reset-checkpoint', '--retry-failed', '--scope', '--scopes', '--secret', '--self-transfer', '--services', '--set', '--shared-skills', '--short', '--show-toplevel', '--slug-prefixes', '--source', '--source-id', '--source-ids', '--stale', '--status', '--surface', '--takes-holders', '--token', '--token-command', '--token-endpoint-auth-method', '--token-env', '--token-ttl', '--unset-all', '--url', '--usage', '--yes'],
++  'sources': ['--abbrev-ref', '--abort', '--access', '--account', '--admin-intent', '--after', '--all', '--allow-unverified-remote', '--allowed-operations', '--app-id', '--app-install', '--app-pem', '--apply', '--audit', '--backups', '--before', '--bound-brain', '--bound-max-concurrent', '--bound-slug-prefixes', '--bound-source', '--bound-tools', '--brain', '--branch', '--budget-usd-per-day', '--cached', '--calendar-id', '--cleanup-dead-local-locks', '--clear', '--clone-dir', '--confirm-destructive', '--confirm-quiesced', '--count', '--days', '--decisions', '--delegated-namespace', '--delegated-slug-prefixes', '--detect', '--diff-filter', '--dir', '--dry-run', '--exclude', '--exclude-standard', '--exit-code', '--expected-epoch', '--expected-incarnation', '--expected-state', '--federated', '--federated-read', '--file', '--fix', '--force', '--format', '--from', '--get', '--get-url', '--git-dir', '--git-path', '--github-repo', '--grant-types', '--help', '--history-days', '--http', '--id', '--include', '--include-warns', '--is-ancestor', '--is-inside-work-tree', '--json', '--keep-storage', '--kind', '--limit', '--local', '--manifest', '--max-cost-usd', '--message', '--name', '--name-only', '--no-cron', '--no-embed', '--no-federate', '--no-federated', '--no-harden', '--no-pull', '--no-tags', '--no-verify', '--no-write-fetch-head', '--others', '--out', '--params', '--pat-file', '--path', '--plan', '--preview', '--probe', '--profile', '--push', '--push-only', '--quiet', '--rebase', '--redirect-uri', '--remove-backup', '--repair', '--replace', '--repos', '--request-id', '--reset-checkpoint', '--retire-missing-checkout', '--retry-failed', '--scope', '--scopes', '--secret', '--self-transfer', '--services', '--set', '--shared-skills', '--short', '--show-toplevel', '--slug-prefixes', '--source', '--source-id', '--source-ids', '--stale', '--status', '--surface', '--takes-holders', '--token', '--token-command', '--token-endpoint-auth-method', '--token-env', '--token-ttl', '--unset-all', '--url', '--usage', '--yes'],
+   'status': ['--abbrev-ref', '--all', '--allow-empty', '--brain', '--break-lock', '--cached', '--concurrency', '--confirm-destructive', '--deadline-ms', '--diff-filter', '--empty', '--exclude', '--exclude-standard', '--fast', '--filters', '--fix', '--force-break-lock', '--format', '--full', '--full-history', '--hard-deadline', '--help', '--include-gitignored', '--include-hidden', '--install', '--interval', '--is-ancestor', '--is-shallow-repository', '--json', '--max-age', '--max-sources', '--mcp-only', '--missing-path', '--name-only', '--no-auto-embed', '--no-delegate', '--no-embed', '--no-extract', '--no-gpg-sign', '--no-hard-deadline', '--no-pull', '--no-renames', '--no-schema-pack', '--no-verify', '--others', '--parallel', '--path', '--priority', '--quiet', '--repo', '--reset-checkpoint', '--retry-failed', '--section', '--serial', '--show-toplevel', '--skip-failed', '--slugs', '--source', '--source-id', '--src-subpath', '--stale', '--strategy', '--timeout', '--url', '--verify', '--watch', '--workers', '--working-tree', '--yes'],
+   'storage': ['--brain', '--fix', '--help', '--json', '--repo', '--restore-only', '--source', '--to'],
+   'sweep': ['--background', '--batch-limit', '--brain', '--budget-ms', '--delete-brain', '--explain', '--follow', '--help', '--home', '--json', '--no-delegate', '--once', '--progress-interval', '--progress-json', '--quiet', '--source', '--timeout'],
+diff --git a/src/core/persistence/administration.ts b/src/core/persistence/administration.ts
+index caf60bc47..19435b23a 100644
+--- a/src/core/persistence/administration.ts
++++ b/src/core/persistence/administration.ts
+@@ -133,14 +133,16 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
+     return runManagedSourceLifecycle(engine, { ...managedSourceAddInput(options), dryRun: params.dry_run === true });
+   }
+   if(operation==='source_lifecycle') {
+-    keys(params,['action','source_id','request_id','expected_incarnation','path','name','config','refederate','confirm_destructive','dry_run','remote_url','create_directory','expired_only']);
++    keys(params,['action','source_id','request_id','expected_incarnation','path','name','config','refederate','confirm_destructive','dry_run','remote_url','create_directory','expired_only','retire_missing_checkout']);
+     if (params.action === 'claim') throw new OperationError('writer_admin_intent_required', 'Claims require the dedicated state-bound writer administration surface.', WRITER_INSPECTION_HINT);
++    if (params.retire_missing_checkout !== undefined && typeof params.retire_missing_checkout !== 'boolean') throw invalid('retire_missing_checkout must be a boolean.');
+     const { runManagedSourceLifecycle }=await import('./source-lifecycle.ts');
+     return runManagedSourceLifecycle(engine,{operation:params.action as import('./source-lifecycle.ts').SourceLifecycleInput['operation'],sourceId:source(params.source_id),
+       requestId:params.request_id as string|undefined,expectedIncarnation:params.expected_incarnation as string|undefined,
+       path:params.path===undefined?undefined:path(params.path),name:params.name as string|undefined,config:params.config as Record<string,unknown>|undefined,
+       refederate:params.refederate as boolean|undefined,confirmDestructive:params.confirm_destructive as boolean|undefined,dryRun:params.dry_run===true,
+-      remoteUrl:params.remote_url as string|undefined,createDirectory:params.create_directory as boolean|undefined,expiredOnly:params.expired_only as boolean|undefined});
++      remoteUrl:params.remote_url as string|undefined,createDirectory:params.create_directory as boolean|undefined,expiredOnly:params.expired_only as boolean|undefined,
++      retireMissingCheckout:params.retire_missing_checkout===true});
+   }
+   if (operation === 'writer_status') {
+     keys(params, ['source_id', 'probe']);
+diff --git a/src/core/persistence/source-lifecycle.ts b/src/core/persistence/source-lifecycle.ts
+index d3330eacc..13b0928fb 100644
+--- a/src/core/persistence/source-lifecycle.ts
++++ b/src/core/persistence/source-lifecycle.ts
+@@ -32,9 +32,35 @@ export interface SourceLifecycleInput {
+   requireGitContent?:boolean;
+   expectedAdminState?:string;
+   automaticClaim?:boolean;
++  /** Explicit opt-in: skip missing-checkout hashing for empty archive/remove only (#5219). */
++  retireMissingCheckout?:boolean;
+ }
+ interface SourceState {id:string;incarnation:string;archived:boolean;local_path:string|null;config:Record<string,unknown>;name:string;last_commit:string|null;}
+ 
++/** Narrow #5219 gate: archive|remove of a truly empty source may skip a deleted checkout. */
++async function emptySourceRetireGate(engine:BrainEngine,sourceId:string):Promise<{ok:true}|{ok:false;reason:string}>{
++  const [pages]=await engine.executeRaw<{live:string;soft:string}>(
++    `SELECT count(*) FILTER (WHERE deleted_at IS NULL)::text AS live,
++            count(*) FILTER (WHERE deleted_at IS NOT NULL)::text AS soft
++     FROM pages WHERE source_id=$1`,[sourceId]);
++  const [chunks]=await engine.executeRaw<{count:string}>(
++    `SELECT count(*)::text AS count FROM content_chunks cc
++     JOIN pages p ON p.id=cc.page_id WHERE p.source_id=$1`,[sourceId]);
++  const live=Number(pages.live),soft=Number(pages.soft),chunkCount=Number(chunks.count);
++  if(live>0||soft>0||chunkCount>0){
++    const parts=[
++      live>0?`${live} live page(s)`:null,
++      soft>0?`${soft} soft-deleted page(s)`:null,
++      chunkCount>0?`${chunkCount} chunk(s)`:null,
++    ].filter(Boolean);
++    return {ok:false,reason:`Source still has ${parts.join(', ')}; restore the verified checkout or empty the source before retiring.`};
++  }
++  const [mirror]=await engine.executeRaw<{id:string}>(`SELECT id FROM persistence_effects WHERE source_id=$1 AND
++    (recovery IS NOT NULL OR state='running' OR (kind='withdrawal-mirror' AND state<>'committed')) LIMIT 1`,[sourceId]);
++  if(mirror) return {ok:false,reason:'Finish the pending withdrawal mirror and publication effects before retiring a missing checkout.'};
++  return {ok:true};
++}
++
+ function localRoot(path:string,create=false):{source:string;worktree:string}{
+   if(!isAbsolute(path)||path.includes('\0')) throw new OperationError('invalid_params','Source path must be an absolute directory on this host.');
+   const source=create?canonicalFilesystemPath(resolve(path)):realpathSync(resolve(path));
+@@ -77,10 +103,12 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
+   after(tx: BrainEngine, incarnation: string): Promise<void>;
+ }):Promise<Record<string,unknown>>{
+   if(!['add','claim','archive','restore','remove','purge','rebind','reclone'].includes(input.operation)) throw new OperationError('invalid_params','Unknown source lifecycle operation.');
+-  for(const key of ['dryRun','refederate','confirmDestructive','createDirectory','expiredOnly','requireGitContent'] as const) if(input[key]!==undefined&&typeof input[key]!=='boolean') throw new OperationError('invalid_params',`${key} must be a boolean.`);
++  for(const key of ['dryRun','refederate','confirmDestructive','createDirectory','expiredOnly','requireGitContent','retireMissingCheckout'] as const) if(input[key]!==undefined&&typeof input[key]!=='boolean') throw new OperationError('invalid_params',`${key} must be a boolean.`);
+   for(const key of ['path','name','expectedIncarnation','requestId','remoteUrl'] as const) if(input[key]!==undefined&&(typeof input[key]!=='string'||input[key]!.length>8192)) throw new OperationError('invalid_params',`${key} must be a bounded string.`);
+   if(input.config!==undefined&&(!input.config||Array.isArray(input.config)||typeof input.config!=='object'||Buffer.byteLength(JSON.stringify(input.config))>8192)) throw new OperationError('invalid_params','Source configuration must be a bounded object.');
+   if(!isValidSourceId(input.sourceId)) throw new OperationError('invalid_params','A valid explicit source ID is required.');
++  if(input.retireMissingCheckout===true&&!['archive','remove'].includes(input.operation))
++    throw new OperationError('invalid_params','--retire-missing-checkout applies only to sources archive and sources remove.');
+   const requestId=input.requestId??randomUUID();
+   if(!isWriteRequestId(requestId) || input.expectedIncarnation!==undefined&&!isWriteRequestId(input.expectedIncarnation))
+     throw new OperationError('invalid_params','request_id and expected_incarnation must be UUIDs.');
+@@ -106,7 +134,22 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
+     // connection checked out. The final transaction rejects new pending mirrors.
+     const manifests=new Map<string,ReturnType<typeof worktreeManifest>>();
+     for(const path of new Set([...bindings.map(binding=>binding.local_path!).filter(Boolean),...(root?[root.worktree]:[])])) {
+-      if(!existsSync(path)) {if(input.operation==='add'&&input.createDirectory&&path===root?.worktree)continue;throw new OperationError('recovery_required','The canonical checkout is missing; restore its verified manifest first.');}
++      if(!existsSync(path)) {
++        if(input.operation==='add'&&input.createDirectory&&path===root?.worktree)continue;
++        // #5219: only archive|remove of a verified-empty source may skip hashing a deleted checkout.
++        if(input.retireMissingCheckout===true&&['archive','remove'].includes(input.operation)){
++          const onPath=[...new Set(bindings.filter(binding=>binding.local_path===path).map(binding=>binding.source_id))];
++          if(!onPath.includes(input.sourceId)) onPath.push(input.sourceId);
++          for(const id of onPath){
++            const gate=await emptySourceRetireGate(engine,id);
++            if(!gate.ok) throw new OperationError('recovery_required',gate.reason);
++          }
++          continue;
++        }
++        throw new OperationError('recovery_required',
++          'The canonical checkout is missing; restore its verified manifest first.',
++          'For a source with zero pages, zero soft-deleted pages, and zero chunks, retry with --retire-missing-checkout on archive or remove.');
++      }
+       const manifest=worktreeManifest(path);
+       if(Buffer.byteLength(JSON.stringify(manifest))>1_048_576) throw new OperationError('request_too_large','The verified source manifest exceeds the 1 MiB administration metadata bound.');
+       manifests.set(path,manifest);
+diff --git a/test/persistence-source-lifecycle.test.ts b/test/persistence-source-lifecycle.test.ts
+index 80539be24..388a98279 100644
+--- a/test/persistence-source-lifecycle.test.ts
++++ b/test/persistence-source-lifecycle.test.ts
+@@ -1,7 +1,7 @@
+ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+ import { randomUUID } from 'node:crypto';
+ import { execFileSync } from 'node:child_process';
+-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
++import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+ import { basename, join } from 'node:path';
+ import { isPhysicalRootMetadata } from '../src/core/persistence/physical-root.ts';
+ import { tmpdir } from 'node:os';
+@@ -11,6 +11,7 @@ import { withEnv } from './helpers/with-env.ts';
+ import { registerLocalWriter, revokeLocalWriter } from '../src/core/persistence/identity.ts';
+ import { claimWorktree, getWorktreeBinding, worktreeManifest } from '../src/core/persistence/ownership.ts';
+ import { runManagedSourceLifecycle } from '../src/core/persistence/source-lifecycle.ts';
++import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
+ import { admitWrite, claimNextWrite } from '../src/core/persistence/journal.ts';
+ import { submissionAuthority } from '../src/core/persistence/authority.ts';
+ import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+@@ -19,6 +20,7 @@ import { addSource, removeSource } from '../src/core/sources-ops.ts';
+ import { softDeleteSource, restoreSource } from '../src/core/destructive-guard.ts';
+ import { topologyDirectoryBytes } from '../src/core/persistence/topology-filesystem.ts';
+ import { topologyPrincipal } from '../src/core/persistence/topology-locks.ts';
++import { parseSourceLifecycleArgs } from '../src/commands/sources-lifecycle-args.ts';
+ 
+ import type { BrainEngine } from '../src/core/engine.ts';
+ import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
+@@ -46,6 +48,11 @@ async function fixture(run:(home:string,source:string,root:string)=>Promise<void
+     await run(home,source,root);
+   });}finally{rmSync(home,{recursive:true,force:true});}
+ }
++async function putLivePage(source:string,slug='held'){
++  await engine.transaction(tx=>withCoordinatedWrite(tx,[source],()=>tx.putPage(slug,{
++    type:'note',title:slug,compiled_truth:'Held page body',timeline:'',frontmatter:{},
++  },{sourceId:source})));
++}
+ async function queued(source:string,requestId=randomUUID()){
+   const binding=(await getWorktreeBinding(engine,source))!;
+   const authority=await submissionAuthority({engine,config:{engine:'pglite'},remote:false,sourceId:source,dryRun:false,logger:{info(){},warn(){},error(){}}},'put_page',source,binding.source_incarnation,'queued');
+@@ -315,4 +322,91 @@ test('remote URL changes during clone preparation refuse publication',()=>fixtur
+   for(const counter of counters){expect(counter.outstanding_count).toBe('0');expect(counter.intent_bytes).toBe('0');expect(counter.recovery_bytes).toBe('0');}
+ }),60_000);
+ 
++// #5219 — empty source whose checkout was deleted out-of-band must be
++// retiable via an explicit opt-in; populated / soft-deleted / flagless paths stay blocked.
++test('empty source with deleted checkout cannot archive or remove without retire-missing-checkout (#5219)',()=>fixture(async(_home,source,root)=>{
++  rmSync(root,{recursive:true,force:true});
++  await expect(runManagedSourceLifecycle(engine,{operation:'archive',sourceId:source}))
++    .rejects.toMatchObject({code:'recovery_required'});
++  await expect(runManagedSourceLifecycle(engine,{operation:'remove',sourceId:source,confirmDestructive:true}))
++    .rejects.toMatchObject({code:'recovery_required'});
++  expect((await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source]))).toHaveLength(1);
++}),60_000);
++
++test('retire-missing-checkout archives and removes zero-page sources whose checkout is gone (#5219)',()=>fixture(async(_home,source,root)=>{
++  expect((await engine.executeRaw('SELECT id FROM pages WHERE source_id=$1',[source]))).toHaveLength(0);
++  rmSync(root,{recursive:true,force:true});
++  const archiveId=randomUUID();
++  const archived=await runManagedSourceLifecycle(engine,{
++    operation:'archive',sourceId:source,retireMissingCheckout:true,requestId:archiveId,
++  });
++  expect(archived).toMatchObject({state:'committed',operation:'archive',source_id:source});
++  expect(await runManagedSourceLifecycle(engine,{
++    operation:'archive',sourceId:source,retireMissingCheckout:true,requestId:archiveId,
++  })).toEqual(archived);
++  expect((await engine.executeRaw<{archived:boolean}>('SELECT archived FROM sources WHERE id=$1',[source]))[0].archived).toBe(true);
++  expect(existsSync(root)).toBe(false);
++
++  const removeId=randomUUID();
++  const removed=await runManagedSourceLifecycle(engine,{
++    operation:'remove',sourceId:source,confirmDestructive:true,retireMissingCheckout:true,requestId:removeId,
++  });
++  expect(removed).toMatchObject({state:'committed',operation:'remove',source_id:source,pages_deleted:0,storage_retained:true});
++  expect(await runManagedSourceLifecycle(engine,{
++    operation:'remove',sourceId:source,confirmDestructive:true,retireMissingCheckout:true,requestId:removeId,
++  })).toEqual(removed);
++  expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source])).toHaveLength(0);
++  expect(await engine.executeRaw('SELECT source_id FROM persistence_source_bindings WHERE source_id=$1',[source])).toHaveLength(0);
++  expect(existsSync(root)).toBe(false);
++}),60_000);
++
++test('retire-missing-checkout refuses sources that still have live pages (#5219)',()=>fixture(async(_home,source,root)=>{
++  await putLivePage(source,'kept');
++  rmSync(root,{recursive:true,force:true});
++  await expect(runManagedSourceLifecycle(engine,{
++    operation:'archive',sourceId:source,retireMissingCheckout:true,
++  })).rejects.toMatchObject({code:'recovery_required',message:expect.stringMatching(/live page/)});
++  await expect(runManagedSourceLifecycle(engine,{
++    operation:'remove',sourceId:source,confirmDestructive:true,retireMissingCheckout:true,
++  })).rejects.toMatchObject({code:'recovery_required',message:expect.stringMatching(/live page/)});
++  expect((await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source]))).toHaveLength(1);
++  expect((await engine.executeRaw('SELECT id FROM pages WHERE source_id=$1',[source]))).toHaveLength(1);
++}),60_000);
++
++test('retire-missing-checkout refuses sources that still have soft-deleted pages (#5219)',()=>fixture(async(_home,source,root)=>{
++  await putLivePage(source,'tombstone');
++  await engine.transaction(tx=>withCoordinatedWrite(tx,[source],()=>tx.softDeletePage('tombstone',{sourceId:source})));
++  expect((await engine.executeRaw<{deleted_at:string|null}>('SELECT deleted_at FROM pages WHERE source_id=$1',[source]))[0].deleted_at).not.toBeNull();
++  rmSync(root,{recursive:true,force:true});
++  await expect(runManagedSourceLifecycle(engine,{
++    operation:'archive',sourceId:source,retireMissingCheckout:true,
++  })).rejects.toMatchObject({code:'recovery_required',message:expect.stringMatching(/soft-deleted page/)});
++  expect((await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source]))).toHaveLength(1);
++}),60_000);
++
++test('stub recreation at the old path still fails physical identity (#5219)',()=>fixture(async(_home,source,root)=>{
++  rmSync(root,{recursive:true,force:true});
++  mkdirSync(root,{recursive:true});
++  writeFileSync(join(root,'example.md'),'---\ntitle: Example\ntype: note\n---\n\nCanonical\n');
++  await expect(runManagedSourceLifecycle(engine,{operation:'rebind',sourceId:source,path:root}))
++    .rejects.toMatchObject({
++      code:'recovery_required',
++      message:expect.stringMatching(/physical checkout identity|belongs to another owner|original checkout is unavailable|manifest/i),
++    });
++  // Retire hatch never applies when a directory exists at the bound path —
++  // operators still cannot launder a stub into a new physical identity.
++  await expect(claimWorktree(engine,source,root)).rejects.toMatchObject({code:'recovery_required'});
++}),60_000);
++
++});
++
++test('sources archive/remove accept --retire-missing-checkout only on those verbs (#5219)',()=>{
++  const archive=parseSourceLifecycleArgs(['archive','lifecycle-source','--retire-missing-checkout'],'11111111-1111-4111-8111-111111111111');
++  expect(archive.params).toMatchObject({action:'archive',source_id:'lifecycle-source',retire_missing_checkout:true});
++  const remove=parseSourceLifecycleArgs(['remove','lifecycle-source','--confirm-destructive','--retire-missing-checkout'],'22222222-2222-4222-8222-222222222222');
++  expect(remove.params).toMatchObject({action:'remove',confirm_destructive:true,retire_missing_checkout:true});
++  expect(()=>parseSourceLifecycleArgs(['restore','lifecycle-source','--retire-missing-checkout'],'33333333-3333-4333-8333-333333333333'))
++    .toThrow(/does not apply/);
++  expect(()=>parseSourceLifecycleArgs(['purge','lifecycle-source','--confirm-destructive','--retire-missing-checkout'],'44444444-4444-4444-8444-444444444444'))
++    .toThrow(/does not apply/);
+ });
+-- 
+2.43.0
+
