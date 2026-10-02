@@ -102,3 +102,21 @@ Discrimination test: reverted `src/core/persistence/source-lifecycle.ts` `src/co
 - `test/persistence-source-lifecycle.test.ts` (new #5219 cases)
 - Adjacent: `test/persistence-physical-root.test.ts`, `test/cli-flag-validation.test.ts`
 - `bun run typecheck`, `bash scripts/check-test-isolation.sh`
+
+## 模型使用
+
+| 项 | 实际 |
+|---|---|
+| 主会话模型 | **Auto**（Cloud Agent `run-info.originalModelName = default`；派单要求显式 Auto） |
+| `~/.cursor/rules/pstack-models.mdc` | **不存在**（本环境无该文件；无覆盖角色行可列） |
+
+按 pstack / poteto 派出的子任务（仅列出实际发起的 Task）：
+
+| 阶段 / 角色 | 派出方式 | 请求的 model 参数 | 实际生效模型 | 相对 pstack 默认是否回退 |
+|---|---|---|---|---|
+| poteto-mode 定位（读 SKILL + Principles；bug-fix playbook 取向） | `Task` → `poteto-agent` | `inherit` | 继承主会话 **Auto** | poteto skill 默认 bug-fix 角色为 `grok-4.7-xhigh-fast`（poteto 子代理回报：无本地 pstack-models 覆盖）。本次未再派独立 bug-fix 代码子代理，定位阶段本身用 inherit→Auto。 |
+| how / 代码库探查（#5219 守卫与空源门控设计摸底） | `Task` → `explore` | `inherit` | 继承主会话 **Auto** | 用户规则里 how（explorer）默认为 `auto`，与本次 Auto 一致；**无额外回退**。 |
+| bug-fix 实现 / 测试 / 文档（写失败测试、最小修复、跑测、产物） | **未派子代理**；主会话直接执行 | — | 主会话 **Auto** | 用户规则 bug-fix 默认为 `claude-sonnet-5-5-medium`；poteto skill 默认为 `grok-4.7-xhigh-fast`。本次**没有**按该角色再开 Task，整段实现留在主会话 Auto。记为：**未按 pstack bug-fix 角色单独派模，回退/等价于主会话 Auto**。 |
+| why / architect / judgment 专轮 | 未派出 | — | — | 未派出（未确认若派出时会落到哪一档硬件模型名以外的路由细节）。 |
+
+说明：子代理调用时只传了 `model: "inherit"`，工具回报未另附底层供应商模型 slug；除上表外无其它 pstack 子任务。查不到的底层具体模型 ID 标 **未确认**，不猜测。
