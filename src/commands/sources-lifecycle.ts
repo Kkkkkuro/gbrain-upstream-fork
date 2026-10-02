@@ -15,9 +15,9 @@ import { reportPersistenceCliError } from './persistence-delegate.ts';
 
 export const SOURCE_LIFECYCLE_HELP = `Managed source administration:
   gbrain sources add <id> [--path <directory> | --url <https-url> | --kind github|google]
-  gbrain sources archive <id>
+  gbrain sources archive <id> [--retire-missing-checkout]
   gbrain sources restore <id> [--no-federate]
-  gbrain sources remove <id> --confirm-destructive
+  gbrain sources remove <id> --confirm-destructive [--retire-missing-checkout]
   gbrain sources purge <archived-id> --confirm-destructive
   gbrain sources set-path <id> <verified-directory>
   gbrain sources set-path <id> --clear   (connector sources: clear a stale local_path)
@@ -27,7 +27,10 @@ All commands accept --request-id <uuid>, --expected-incarnation <uuid>, --dry-ru
 --brain <id>, and --json. Retain the returned request ID across retries. Rebind
 requires an exact canonical manifest, including deletions; --force cannot bypass
 ownership. Remove and purge retain local storage for explicit operator cleanup.
-Unmanaged installations retain their existing source command behavior.`;
+--retire-missing-checkout applies only to archive/remove of a source with zero
+live pages, zero soft-deleted pages, and zero chunks when the canonical checkout
+directory is already gone; it never skips physical-identity or populated-source
+guards. Unmanaged installations retain their existing source command behavior.`;
 
 function checkManagedOptions(parsed: ParsedSourceLifecycle): void {
   if (parsed.legacyOnly) throw new OperationError('writer_coordinator_required',

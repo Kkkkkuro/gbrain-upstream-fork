@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { isPhysicalRootMetadata } from '../src/core/persistence/physical-root.ts';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,7 @@ import { withEnv } from './helpers/with-env.ts';
 import { registerLocalWriter, revokeLocalWriter } from '../src/core/persistence/identity.ts';
 import { claimWorktree, getWorktreeBinding, worktreeManifest } from '../src/core/persistence/ownership.ts';
 import { runManagedSourceLifecycle } from '../src/core/persistence/source-lifecycle.ts';
+import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { admitWrite, claimNextWrite } from '../src/core/persistence/journal.ts';
 import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -19,6 +20,7 @@ import { addSource, removeSource } from '../src/core/sources-ops.ts';
 import { softDeleteSource, restoreSource } from '../src/core/destructive-guard.ts';
 import { topologyDirectoryBytes } from '../src/core/persistence/topology-filesystem.ts';
 import { topologyPrincipal } from '../src/core/persistence/topology-locks.ts';
+import { parseSourceLifecycleArgs } from '../src/commands/sources-lifecycle-args.ts';
 
 import type { BrainEngine } from '../src/core/engine.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
@@ -45,6 +47,11 @@ async function fixture(run:(home:string,source:string,root:string)=>Promise<void
     await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
     await run(home,source,root);
   });}finally{rmSync(home,{recursive:true,force:true});}
+}
+async function putLivePage(source:string,slug='held'){
+  await engine.transaction(tx=>withCoordinatedWrite(tx,[source],()=>tx.putPage(slug,{
+    type:'note',title:slug,compiled_truth:'Held page body',timeline:'',frontmatter:{},
+  },{sourceId:source})));
 }
 async function queued(source:string,requestId=randomUUID()){
   const binding=(await getWorktreeBinding(engine,source))!;
@@ -315,4 +322,91 @@ test('remote URL changes during clone preparation refuse publication',()=>fixtur
   for(const counter of counters){expect(counter.outstanding_count).toBe('0');expect(counter.intent_bytes).toBe('0');expect(counter.recovery_bytes).toBe('0');}
 }),60_000);
 
+// #5219 — empty source whose checkout was deleted out-of-band must be
+// retiable via an explicit opt-in; populated / soft-deleted / flagless paths stay blocked.
+test('empty source with deleted checkout cannot archive or remove without retire-missing-checkout (#5219)',()=>fixture(async(_home,source,root)=>{
+  rmSync(root,{recursive:true,force:true});
+  await expect(runManagedSourceLifecycle(engine,{operation:'archive',sourceId:source}))
+    .rejects.toMatchObject({code:'recovery_required'});
+  await expect(runManagedSourceLifecycle(engine,{operation:'remove',sourceId:source,confirmDestructive:true}))
+    .rejects.toMatchObject({code:'recovery_required'});
+  expect((await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source]))).toHaveLength(1);
+}),60_000);
+
+test('retire-missing-checkout archives and removes zero-page sources whose checkout is gone (#5219)',()=>fixture(async(_home,source,root)=>{
+  expect((await engine.executeRaw('SELECT id FROM pages WHERE source_id=$1',[source]))).toHaveLength(0);
+  rmSync(root,{recursive:true,force:true});
+  const archiveId=randomUUID();
+  const archived=await runManagedSourceLifecycle(engine,{
+    operation:'archive',sourceId:source,retireMissingCheckout:true,requestId:archiveId,
+  });
+  expect(archived).toMatchObject({state:'committed',operation:'archive',source_id:source});
+  expect(await runManagedSourceLifecycle(engine,{
+    operation:'archive',sourceId:source,retireMissingCheckout:true,requestId:archiveId,
+  })).toEqual(archived);
+  expect((await engine.executeRaw<{archived:boolean}>('SELECT archived FROM sources WHERE id=$1',[source]))[0].archived).toBe(true);
+  expect(existsSync(root)).toBe(false);
+
+  const removeId=randomUUID();
+  const removed=await runManagedSourceLifecycle(engine,{
+    operation:'remove',sourceId:source,confirmDestructive:true,retireMissingCheckout:true,requestId:removeId,
+  });
+  expect(removed).toMatchObject({state:'committed',operation:'remove',source_id:source,pages_deleted:0,storage_retained:true});
+  expect(await runManagedSourceLifecycle(engine,{
+    operation:'remove',sourceId:source,confirmDestructive:true,retireMissingCheckout:true,requestId:removeId,
+  })).toEqual(removed);
+  expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source])).toHaveLength(0);
+  expect(await engine.executeRaw('SELECT source_id FROM persistence_source_bindings WHERE source_id=$1',[source])).toHaveLength(0);
+  expect(existsSync(root)).toBe(false);
+}),60_000);
+
+test('retire-missing-checkout refuses sources that still have live pages (#5219)',()=>fixture(async(_home,source,root)=>{
+  await putLivePage(source,'kept');
+  rmSync(root,{recursive:true,force:true});
+  await expect(runManagedSourceLifecycle(engine,{
+    operation:'archive',sourceId:source,retireMissingCheckout:true,
+  })).rejects.toMatchObject({code:'recovery_required',message:expect.stringMatching(/live page/)});
+  await expect(runManagedSourceLifecycle(engine,{
+    operation:'remove',sourceId:source,confirmDestructive:true,retireMissingCheckout:true,
+  })).rejects.toMatchObject({code:'recovery_required',message:expect.stringMatching(/live page/)});
+  expect((await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source]))).toHaveLength(1);
+  expect((await engine.executeRaw('SELECT id FROM pages WHERE source_id=$1',[source]))).toHaveLength(1);
+}),60_000);
+
+test('retire-missing-checkout refuses sources that still have soft-deleted pages (#5219)',()=>fixture(async(_home,source,root)=>{
+  await putLivePage(source,'tombstone');
+  await engine.transaction(tx=>withCoordinatedWrite(tx,[source],()=>tx.softDeletePage('tombstone',{sourceId:source})));
+  expect((await engine.executeRaw<{deleted_at:string|null}>('SELECT deleted_at FROM pages WHERE source_id=$1',[source]))[0].deleted_at).not.toBeNull();
+  rmSync(root,{recursive:true,force:true});
+  await expect(runManagedSourceLifecycle(engine,{
+    operation:'archive',sourceId:source,retireMissingCheckout:true,
+  })).rejects.toMatchObject({code:'recovery_required',message:expect.stringMatching(/soft-deleted page/)});
+  expect((await engine.executeRaw('SELECT id FROM sources WHERE id=$1',[source]))).toHaveLength(1);
+}),60_000);
+
+test('stub recreation at the old path still fails physical identity (#5219)',()=>fixture(async(_home,source,root)=>{
+  rmSync(root,{recursive:true,force:true});
+  mkdirSync(root,{recursive:true});
+  writeFileSync(join(root,'example.md'),'---\ntitle: Example\ntype: note\n---\n\nCanonical\n');
+  await expect(runManagedSourceLifecycle(engine,{operation:'rebind',sourceId:source,path:root}))
+    .rejects.toMatchObject({
+      code:'recovery_required',
+      message:expect.stringMatching(/physical checkout identity|belongs to another owner|original checkout is unavailable|manifest/i),
+    });
+  // Retire hatch never applies when a directory exists at the bound path —
+  // operators still cannot launder a stub into a new physical identity.
+  await expect(claimWorktree(engine,source,root)).rejects.toMatchObject({code:'recovery_required'});
+}),60_000);
+
+});
+
+test('sources archive/remove accept --retire-missing-checkout only on those verbs (#5219)',()=>{
+  const archive=parseSourceLifecycleArgs(['archive','lifecycle-source','--retire-missing-checkout'],'11111111-1111-4111-8111-111111111111');
+  expect(archive.params).toMatchObject({action:'archive',source_id:'lifecycle-source',retire_missing_checkout:true});
+  const remove=parseSourceLifecycleArgs(['remove','lifecycle-source','--confirm-destructive','--retire-missing-checkout'],'22222222-2222-4222-8222-222222222222');
+  expect(remove.params).toMatchObject({action:'remove',confirm_destructive:true,retire_missing_checkout:true});
+  expect(()=>parseSourceLifecycleArgs(['restore','lifecycle-source','--retire-missing-checkout'],'33333333-3333-4333-8333-333333333333'))
+    .toThrow(/does not apply/);
+  expect(()=>parseSourceLifecycleArgs(['purge','lifecycle-source','--confirm-destructive','--retire-missing-checkout'],'44444444-4444-4444-8444-444444444444'))
+    .toThrow(/does not apply/);
 });

@@ -32,8 +32,34 @@ export interface SourceLifecycleInput {
   requireGitContent?:boolean;
   expectedAdminState?:string;
   automaticClaim?:boolean;
+  /** Explicit opt-in: skip missing-checkout hashing for empty archive/remove only (#5219). */
+  retireMissingCheckout?:boolean;
 }
 interface SourceState {id:string;incarnation:string;archived:boolean;local_path:string|null;config:Record<string,unknown>;name:string;last_commit:string|null;}
+
+/** Narrow #5219 gate: archive|remove of a truly empty source may skip a deleted checkout. */
+async function emptySourceRetireGate(engine:BrainEngine,sourceId:string):Promise<{ok:true}|{ok:false;reason:string}>{
+  const [pages]=await engine.executeRaw<{live:string;soft:string}>(
+    `SELECT count(*) FILTER (WHERE deleted_at IS NULL)::text AS live,
+            count(*) FILTER (WHERE deleted_at IS NOT NULL)::text AS soft
+     FROM pages WHERE source_id=$1`,[sourceId]);
+  const [chunks]=await engine.executeRaw<{count:string}>(
+    `SELECT count(*)::text AS count FROM content_chunks cc
+     JOIN pages p ON p.id=cc.page_id WHERE p.source_id=$1`,[sourceId]);
+  const live=Number(pages.live),soft=Number(pages.soft),chunkCount=Number(chunks.count);
+  if(live>0||soft>0||chunkCount>0){
+    const parts=[
+      live>0?`${live} live page(s)`:null,
+      soft>0?`${soft} soft-deleted page(s)`:null,
+      chunkCount>0?`${chunkCount} chunk(s)`:null,
+    ].filter(Boolean);
+    return {ok:false,reason:`Source still has ${parts.join(', ')}; restore the verified checkout or empty the source before retiring.`};
+  }
+  const [mirror]=await engine.executeRaw<{id:string}>(`SELECT id FROM persistence_effects WHERE source_id=$1 AND
+    (recovery IS NOT NULL OR state='running' OR (kind='withdrawal-mirror' AND state<>'committed')) LIMIT 1`,[sourceId]);
+  if(mirror) return {ok:false,reason:'Finish the pending withdrawal mirror and publication effects before retiring a missing checkout.'};
+  return {ok:true};
+}
 
 function localRoot(path:string,create=false):{source:string;worktree:string}{
   if(!isAbsolute(path)||path.includes('\0')) throw new OperationError('invalid_params','Source path must be an absolute directory on this host.');
@@ -77,10 +103,12 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
   after(tx: BrainEngine, incarnation: string): Promise<void>;
 }):Promise<Record<string,unknown>>{
   if(!['add','claim','archive','restore','remove','purge','rebind','reclone'].includes(input.operation)) throw new OperationError('invalid_params','Unknown source lifecycle operation.');
-  for(const key of ['dryRun','refederate','confirmDestructive','createDirectory','expiredOnly','requireGitContent'] as const) if(input[key]!==undefined&&typeof input[key]!=='boolean') throw new OperationError('invalid_params',`${key} must be a boolean.`);
+  for(const key of ['dryRun','refederate','confirmDestructive','createDirectory','expiredOnly','requireGitContent','retireMissingCheckout'] as const) if(input[key]!==undefined&&typeof input[key]!=='boolean') throw new OperationError('invalid_params',`${key} must be a boolean.`);
   for(const key of ['path','name','expectedIncarnation','requestId','remoteUrl'] as const) if(input[key]!==undefined&&(typeof input[key]!=='string'||input[key]!.length>8192)) throw new OperationError('invalid_params',`${key} must be a bounded string.`);
   if(input.config!==undefined&&(!input.config||Array.isArray(input.config)||typeof input.config!=='object'||Buffer.byteLength(JSON.stringify(input.config))>8192)) throw new OperationError('invalid_params','Source configuration must be a bounded object.');
   if(!isValidSourceId(input.sourceId)) throw new OperationError('invalid_params','A valid explicit source ID is required.');
+  if(input.retireMissingCheckout===true&&!['archive','remove'].includes(input.operation))
+    throw new OperationError('invalid_params','--retire-missing-checkout applies only to sources archive and sources remove.');
   const requestId=input.requestId??randomUUID();
   if(!isWriteRequestId(requestId) || input.expectedIncarnation!==undefined&&!isWriteRequestId(input.expectedIncarnation))
     throw new OperationError('invalid_params','request_id and expected_incarnation must be UUIDs.');
@@ -106,7 +134,22 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     // connection checked out. The final transaction rejects new pending mirrors.
     const manifests=new Map<string,ReturnType<typeof worktreeManifest>>();
     for(const path of new Set([...bindings.map(binding=>binding.local_path!).filter(Boolean),...(root?[root.worktree]:[])])) {
-      if(!existsSync(path)) {if(input.operation==='add'&&input.createDirectory&&path===root?.worktree)continue;throw new OperationError('recovery_required','The canonical checkout is missing; restore its verified manifest first.');}
+      if(!existsSync(path)) {
+        if(input.operation==='add'&&input.createDirectory&&path===root?.worktree)continue;
+        // #5219: only archive|remove of a verified-empty source may skip hashing a deleted checkout.
+        if(input.retireMissingCheckout===true&&['archive','remove'].includes(input.operation)){
+          const onPath=[...new Set(bindings.filter(binding=>binding.local_path===path).map(binding=>binding.source_id))];
+          if(!onPath.includes(input.sourceId)) onPath.push(input.sourceId);
+          for(const id of onPath){
+            const gate=await emptySourceRetireGate(engine,id);
+            if(!gate.ok) throw new OperationError('recovery_required',gate.reason);
+          }
+          continue;
+        }
+        throw new OperationError('recovery_required',
+          'The canonical checkout is missing; restore its verified manifest first.',
+          'For a source with zero pages, zero soft-deleted pages, and zero chunks, retry with --retire-missing-checkout on archive or remove.');
+      }
       const manifest=worktreeManifest(path);
       if(Buffer.byteLength(JSON.stringify(manifest))>1_048_576) throw new OperationError('request_too_large','The verified source manifest exceeds the 1 MiB administration metadata bound.');
       manifests.set(path,manifest);

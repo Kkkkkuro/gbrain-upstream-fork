@@ -31,7 +31,7 @@ export function parseSourceLifecycleArgs(args: string[], generatedId = randomUUI
   const flags = new Set<string>();
   const positionals: string[] = [];
   const booleans = new Set(['json', 'dry-run', 'yes', 'confirm-destructive', 'keep-storage', 'force',
-    'federated', 'no-federated', 'no-federate', 'refederate', 'no-harden']);
+    'federated', 'no-federated', 'no-federate', 'refederate', 'no-harden', 'retire-missing-checkout']);
   const valued = new Set(['request-id', 'expected-incarnation', 'brain', 'path', 'url', 'name', 'clone-dir',
     'pat-file', 'kind', 'account', 'access', 'token-command', 'token-env', 'services', 'history-days',
     'calendar-id', 'scope', 'repos', 'dir', 'app-id', 'app-pem', 'app-install']);
@@ -67,7 +67,8 @@ export function parseSourceLifecycleArgs(args: string[], generatedId = randomUUI
   const allowed = verb === 'add' ? new Set([...common, ...valued, 'federated', 'no-federated', 'force', 'no-harden'])
     : new Set([...common, ...(verb === 'set-path' ? ['path', 'force'] : []),
       ...(['remove', 'purge'].includes(verb) ? ['yes', 'confirm-destructive', 'keep-storage'] : []),
-      ...(verb === 'restore' ? ['no-federate', 'refederate'] : [])]);
+      ...(verb === 'restore' ? ['no-federate', 'refederate'] : []),
+      ...(['archive', 'remove'].includes(verb) ? ['retire-missing-checkout'] : [])]);
   for (const key of [...values.keys(), ...flags]) if (!allowed.has(key)) throw invalid(`--${key} does not apply to sources ${verb}.`);
   if (verb === 'set-path') {
     if (positionals.length && values.has('path')) throw invalid('Specify the set-path target once.');
@@ -84,8 +85,8 @@ export function parseSourceLifecycleArgs(args: string[], generatedId = randomUUI
     // --yes must never bypass the populated-source destructive confirmation.
     params.confirm_destructive = flags.has('confirm-destructive');
   }
+  if (flags.has('retire-missing-checkout')) params.retire_missing_checkout = true;
   if (verb !== 'add') return { operation: 'source_lifecycle', params, brain: values.get('brain'), legacyOnly: false, json: flags.has('json') };
-
   if (flags.has('federated') && flags.has('no-federated')) throw invalid('Choose one federation setting.');
   const kind = values.get('kind');
   if (kind !== undefined && !['google', 'github'].includes(kind)) throw invalid('Source kind must be github or google.');
