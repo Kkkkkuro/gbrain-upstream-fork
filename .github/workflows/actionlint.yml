@@ -27,6 +27,7 @@ concurrency:
 
 jobs:
   actionlint:
+    if: github.repository == 'garrytan/gbrain'
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     steps:

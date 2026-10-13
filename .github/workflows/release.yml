@@ -34,6 +34,7 @@ concurrency:
 
 jobs:
   version:
+    if: github.repository == 'garrytan/gbrain'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -70,7 +71,7 @@ jobs:
 
   build:
     needs: version
-    if: needs.version.outputs.exists == 'false'
+    if: ${{ github.repository == 'garrytan/gbrain' && (needs.version.outputs.exists == 'false') }}
     strategy:
       matrix:
         include:
@@ -140,7 +141,7 @@ jobs:
 
   release:
     needs: [version, build]
-    if: needs.version.outputs.exists == 'false'
+    if: ${{ github.repository == 'garrytan/gbrain' && (needs.version.outputs.exists == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -207,7 +208,7 @@ jobs:
   # Documented in docs/RELEASING.md.
   publish-template:
     needs: [version, release]
-    if: needs.version.outputs.exists == 'false'
+    if: ${{ github.repository == 'garrytan/gbrain' && (needs.version.outputs.exists == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -293,7 +294,7 @@ jobs:
   # installs. Same trust model as the force-advanced latest-stable tag.
   publish-codex-plugin:
     needs: [version, release]
-    if: needs.version.outputs.exists == 'false'
+    if: ${{ github.repository == 'garrytan/gbrain' && (needs.version.outputs.exists == 'false') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write  # force-push the codex-plugin branch of THIS repo

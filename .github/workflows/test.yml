@@ -39,6 +39,7 @@ jobs:
   # native target on the primary Bun version; other pull requests run the Linux
   # x64 smoke cell. Pushes, schedules and manual runs always run the full matrix.
   changes:
+    if: github.repository == 'garrytan/gbrain'
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     permissions:
@@ -71,7 +72,7 @@ jobs:
 
   # Re-run checks for every event. Only dependencies and PGLite snapshots are cached.
   gitleaks:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 10
     steps:
@@ -120,7 +121,7 @@ jobs:
           gitleaks detect --redact --no-banner --log-opts "$RANGE"
 
   security-regressions:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubicloud-standard-2-ubuntu-2404' || matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -143,7 +144,7 @@ jobs:
         run: bun test --timeout 60000 test/guarded-http-tls.serial.test.ts
 
   dependency-audit:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 10
     steps:
@@ -159,7 +160,7 @@ jobs:
         working-directory: admin
 
   verify:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     # Pre-test gates: privacy/jsonb/source-id/etc + typecheck + admin-build.
     # Lives in its own runner so the matrix shards aren't carrying ~2-3min
     # of verify work in addition to their test files (the old shape stuffed
@@ -204,7 +205,7 @@ jobs:
       - run: bash scripts/check-bun-test-timeout.sh
 
   serial-tests:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     # *.serial.test.ts — one bun process per file (module-registry isolation),
     # POOLED across files by scripts/run-serial-tests.sh (was strictly
     # sequential: an 8.5-minute job whose serialization the quarantine
@@ -282,7 +283,7 @@ jobs:
           overwrite: true
 
   slow-eval-longmemeval:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     # Dedicated runner for the LongMemEval end-to-end test file. The file
     # was originally 359s. TODO #1 (engine-sharing in runEvalLongMemEval
     # via RunOpts.engine) cut it to ~200s by amortizing PGLite cold-create
@@ -329,7 +330,7 @@ jobs:
           overwrite: true
 
   slow-brainbench-e2e:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     # Dedicated runner for the BrainBench CLI e2e file. At 98s mined it was
     # the matrix's single heaviest atom (10% of the whole corpus weight) and
     # the hard floor on shard-count scaling; a Phase-2 rewrite (spawn batching
@@ -394,7 +395,7 @@ jobs:
           overwrite: true
 
   brainbench:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     # BrainBench memory-conformance gate (Cathedral 2). Hermetic: in-memory
     # PGLite, zero API keys, ~15s for the full 141-fixture × 3-harness run.
     # Governance (decision 4): compares HEAD's run against MAIN's committed
@@ -436,7 +437,7 @@ jobs:
           fi
 
   slow-entity-resolve-perf:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     # Dedicated runner for the entity-resolve perf test (~159s, single perf
     # describe with one test that builds 5000+ pages and asserts the NEW
     # tryPrefixExpansion shape is 5x faster than the OLD shape — not
@@ -502,7 +503,7 @@ jobs:
           bun run src/cli.ts protocol conformance --synthesize
 
   test:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     # Pure matrix shard — no verify, no serial. Each shard runs its slice
     # of the unit test set under one `bun test` invocation.
     #
@@ -580,7 +581,7 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────
   coverage-report:
     needs: [serial-tests, slow-eval-longmemeval, slow-entity-resolve-perf, slow-brainbench-e2e, test]
-    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (always() && (github.event_name != 'workflow_dispatch' || inputs.native_only != true)) }}
     runs-on: ubicloud-standard-4-ubuntu-2404
     timeout-minutes: 10
     steps:
@@ -635,17 +636,18 @@ jobs:
           overwrite: true
 
   native-locks:
+    if: github.repository == 'garrytan/gbrain'
     needs: [changes]
     uses: ./.github/workflows/native-locks.yml
     with:
       scope: ${{ needs.changes.outputs.native-scope }}
 
   persistence-validation:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     uses: ./.github/workflows/persistence-validation.yml
 
   admin-browser:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     runs-on: ubicloud-standard-4-ubuntu-2404
     timeout-minutes: 12
     steps:
@@ -672,7 +674,7 @@ jobs:
           retention-days: 7
 
   shared-skills-compatibility:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
     runs-on: ubicloud-standard-4-ubuntu-2404
     timeout-minutes: 10
     steps:
@@ -691,7 +693,7 @@ jobs:
   test-status:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.native_only == true && 'full-suite-not-run' || 'test-status' }}
     needs: [gitleaks, security-regressions, dependency-audit, verify, serial-tests, slow-eval-longmemeval, slow-entity-resolve-perf, slow-brainbench-e2e, brainbench, test, native-locks, persistence-validation, admin-browser, shared-skills-compatibility]
-    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (always() && (github.event_name != 'workflow_dispatch' || inputs.native_only != true)) }}
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     steps:
@@ -725,7 +727,7 @@ jobs:
   # A native-only run emits its own scoped result, never the required full-suite check.
   native-only-status:
     name: Native-only result (full CI not run)
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.native_only == true }}
+    if: ${{ github.repository == 'garrytan/gbrain' && (always() && github.event_name == 'workflow_dispatch' && inputs.native_only == true) }}
     needs: [native-locks]
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
