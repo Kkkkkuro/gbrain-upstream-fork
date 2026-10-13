@@ -1,7 +1,8 @@
 import { fileURLToPath } from 'node:url';
-import { INSTALL_SCOPE, installCombinedHook } from '../mini-writer/postinstall.ts';
+import { INSTALL_SCOPE, isMiniWriter, MINI_HOSTNAME } from '../mini-writer/host.ts';
+import { installCombinedHook } from '../mini-writer/postinstall.ts';
 
-export { MINI_HOSTNAME, isMiniWriter } from '../mini-writer/host.ts';
+export { INSTALL_SCOPE, isMiniWriter, MINI_HOSTNAME };
 
 export function installMiniHook(host?: string): 'installed' | 'refused' {
   return installCombinedHook(host);
