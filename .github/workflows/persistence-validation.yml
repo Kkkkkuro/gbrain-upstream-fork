@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   read-performance:
+    if: github.repository == 'garrytan/gbrain'
     name: Read latency / ${{ matrix.engine }} / Bun ${{ matrix.bun }}
     runs-on: ubicloud-standard-4-ubuntu-2404
     timeout-minutes: 55
@@ -51,6 +52,7 @@ jobs:
           if-no-files-found: error
 
   deployment-matrix:
+    if: github.repository == 'garrytan/gbrain'
     name: PgBouncer, RLS and pool capacity / Bun ${{ matrix.bun }}
     runs-on: ubicloud-standard-8-ubuntu-2404
     timeout-minutes: 15
@@ -159,6 +161,7 @@ jobs:
           if-no-files-found: error
 
   invariants:
+    if: github.repository == 'garrytan/gbrain'
     name: ${{ matrix.engine }} / Bun ${{ matrix.bun }}
     # The soak uses 1.3-1.8 busy cores: the 2,500-write PGLite soak took 523s on
     # 4 vCPUs, 539s on 8 and 500s on 16.
@@ -210,6 +213,7 @@ jobs:
   # The reconciliation crash suites run beside the soak instead of after it, so
   # neither holds the other's runner: each is about four minutes on PGLite.
   reconciliation:
+    if: github.repository == 'garrytan/gbrain'
     name: Reconciliation crashes / ${{ matrix.engine }} / Bun ${{ matrix.bun }}
     runs-on: ubicloud-standard-4-ubuntu-2404
     timeout-minutes: 30
