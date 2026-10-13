@@ -37,10 +37,10 @@ describe('CI execution evidence', () => {
     }
     for (const name of ['gitleaks', 'verify']) {
       expect(unit.jobs[name].needs).toBeUndefined();
-      expect(unit.jobs[name].if).toBe("${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}");
+      expect(unit.jobs[name].if).toBe("${{ github.repository == 'garrytan/gbrain' && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}");
     }
     expect(e2e.jobs.tier2.needs).toBe('jsonb-parity');
-    expect(e2e.jobs.tier2.if).toBeUndefined();
+    expect(e2e.jobs.tier2.if).toBe("github.repository == 'garrytan/gbrain'");
   });
 
   test('the verify job runs `bun run verify`, which dispatches through run-verify-parallel.sh', () => {
@@ -50,7 +50,7 @@ describe('CI execution evidence', () => {
   });
 
   test('unit aggregate rejects failed, cancelled or skipped required jobs', () => {
-    expect(unit.jobs['test-status'].if).toBe("${{ always() && (github.event_name != 'workflow_dispatch' || inputs.native_only != true) }}");
+    expect(unit.jobs['test-status'].if).toBe("${{ github.repository == 'garrytan/gbrain' && (always() && (github.event_name != 'workflow_dispatch' || inputs.native_only != true)) }}");
     expect(unit.jobs['test-status'].needs).toEqual([
       'gitleaks', 'security-regressions', 'dependency-audit', 'verify', 'serial-tests', 'slow-eval-longmemeval',
       'slow-entity-resolve-perf', 'slow-brainbench-e2e', 'brainbench', 'test', 'native-locks', 'persistence-validation',
@@ -65,7 +65,7 @@ describe('CI execution evidence', () => {
   });
 
   test('E2E aggregate gates nightly full-corpus execution and allows its skip on other events', () => {
-    expect(e2e.jobs['e2e-status'].if).toBe('always()');
+    expect(e2e.jobs['e2e-status'].if).toBe("${{ github.repository == 'garrytan/gbrain' && (always()) }}");
     const needs = e2e.jobs['e2e-status'].needs as string[];
     const nightly = ['coverage-full-unit', 'coverage-full-serial', 'coverage-full-slow', 'coverage-full-e2e'];
     expect(needs).toEqual(['jsonb-parity', 'tier1', 'tier2', 'prepare-e2e', 'selected-e2e', ...nightly]);
