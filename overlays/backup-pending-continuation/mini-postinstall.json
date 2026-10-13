@@ -1,0 +1,6 @@
+{
+  "install_on": "Mini only. Mini is the only writer. Do not install this hook on any other machine, and do not add it to github:garrytan/gbrain.",
+  "scripts": {
+    "postinstall": "bun <overlay>/reapply.ts"
+  }
+}
