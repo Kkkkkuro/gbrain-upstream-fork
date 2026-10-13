@@ -45,8 +45,10 @@ jobs:
     # because `contains(labels.*.name, ...)` reads the live label set, not the
     # event payload's `label.name` (which is only populated for `labeled`).
     if: |
+      github.repository == 'garrytan/gbrain' && (
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'heavy-tests')
+      )
     runs-on: ubicloud-standard-30-ubuntu-2404
     timeout-minutes: 30
     services:
@@ -133,9 +135,11 @@ jobs:
   real-agent-e2e:
     name: Real-agent door e2e (skips without authed binaries)
     if: |
+      github.repository == 'garrytan/gbrain' && (
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
       contains(github.event.pull_request.labels.*.name, 'heavy-tests')
+      )
     runs-on: ubicloud-standard-16-ubuntu-2404
     timeout-minutes: 20
     env:
@@ -199,9 +203,11 @@ jobs:
   hermes-door:
     name: Hermes door e2e (credentialed, real binary, loud-fail)
     if: |
+      github.repository == 'garrytan/gbrain' && (
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
       contains(github.event.pull_request.labels.*.name, 'heavy-tests')
+      )
     runs-on: ubicloud-standard-16-ubuntu-2404
     # Four serial door tests at 600s each plus the installer budget cannot
     # fit the sibling job's 20 minutes.
@@ -431,10 +437,12 @@ jobs:
   grok-door:
     name: Grok door e2e (real binary, keyless-first)
     if: |
+      github.repository == 'garrytan/gbrain' && (
       (github.event_name == 'pull_request' &&
         contains(github.event.pull_request.labels.*.name, 'real-agent-e2e')) ||
       (github.event_name == 'workflow_dispatch' &&
         inputs.run_grok_door == true)
+      )
     runs-on: ubicloud-standard-16-ubuntu-2404
     # Measured local door wall-time: keyless tier ~29s + one-time compiled
     # gbrain build (~2-4 min) + npm install (~10s); paid SMOKE turn budget
@@ -669,8 +677,10 @@ jobs:
   plugin-doors:
     name: Plugin doors (codex + claude, install tier)
     if: |
+      github.repository == 'garrytan/gbrain' && (
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'heavy-tests')
+      )
     runs-on: ubicloud-standard-16-ubuntu-2404
     timeout-minutes: 30
     env:
@@ -742,9 +752,11 @@ jobs:
   opencode-door:
     name: opencode door e2e (${{ matrix.lane }})
     if: |
+      github.repository == 'garrytan/gbrain' && (
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
       contains(github.event.pull_request.labels.*.name, 'heavy-tests')
+      )
     runs-on: ubicloud-standard-16-ubuntu-2404
     strategy:
       fail-fast: false
@@ -968,7 +980,7 @@ jobs:
   # (OPENCODE-CLI-PIN.md §Pin-refresh cadence), never a gate.
   opencode-door-canary:
     name: opencode door canary (latest, keyless, non-gating)
-    if: github.event_name == 'schedule'
+    if: ${{ github.repository == 'garrytan/gbrain' && (github.event_name == 'schedule') }}
     runs-on: ubicloud-standard-16-ubuntu-2404
     timeout-minutes: 20
     continue-on-error: true

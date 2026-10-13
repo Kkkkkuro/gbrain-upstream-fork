@@ -95,7 +95,7 @@ describe('nightly E2E scheduling', () => {
   test('nightly jobs preserve job-local Postgres, independent artifacts, always-reporting and required execution evidence', () => {
     const workflow = safeLoad(readFileSync(join(repo, '.github/workflows/e2e.yml'), 'utf8')) as any;
     const job = workflow.jobs['coverage-full-e2e'];
-    expect(job.if).toBe(fullProfile);
+    expect(job.if).toBe('${{ github.repository == \'garrytan/gbrain\' && (' + fullProfile + ') }}');
     expect(job.strategy).toEqual({ 'fail-fast': false, matrix: { shard: [1, 2, 3, 4] } });
     expect(job.services.postgres.image).toBe('pgvector/pgvector:pg16');
     const run = job.steps.find((step: any) => step.run === 'bash scripts/run-e2e.sh');
@@ -129,7 +129,7 @@ describe('nightly E2E scheduling', () => {
     }
     const report = workflow.jobs['coverage-full-report'];
     expect(report.needs).toContain('coverage-full-e2e');
-    expect(report.if).toBe(`always() && (${fullProfile})`);
+    expect(report.if).toBe('${{ github.repository == \'garrytan/gbrain\' && (always() && (' + fullProfile + ')) }}');
     const merge = report.steps.find((step: any) => step.name === 'Merge full corpus').run;
     expect(merge).toContain('scripts/verify-nightly-e2e.ts "$RUNNER_TEMP/coverage-artifacts" 4 "$GITHUB_SHA"');
     expect(merge).toContain(',e2e-1,e2e-2,e2e-3,e2e-4');
@@ -147,7 +147,7 @@ describe('nightly E2E scheduling', () => {
       }
     });
     const status = workflow.jobs['e2e-status'];
-    expect(status.if).toBe('always()');
+    expect(status.if).toBe("${{ github.repository == 'garrytan/gbrain' && (always()) }}");
     expect(status.needs).toContain('coverage-full-e2e');
     expect(status.needs).not.toContain('coverage-full-report');
     const validate = status.steps.find((step: any) => step.name === 'Verify complete nightly execution');
@@ -157,7 +157,7 @@ describe('nightly E2E scheduling', () => {
   test('manual full corpus is opt-in and uses the complete scheduled profile without cancelling ordinary runs', () => {
     const workflow = safeLoad(readFileSync(join(repo, '.github/workflows/e2e.yml'), 'utf8')) as any;
     expect(workflow.on.workflow_dispatch.inputs.full_corpus).toMatchObject({ type: 'boolean', default: false });
-    for (const name of ['coverage-full-unit', 'coverage-full-serial', 'coverage-full-slow', 'coverage-full-e2e']) expect(workflow.jobs[name].if).toBe(fullProfile);
+    for (const name of ['coverage-full-unit', 'coverage-full-serial', 'coverage-full-slow', 'coverage-full-e2e']) expect(workflow.jobs[name].if).toBe('${{ github.repository == \'garrytan/gbrain\' && (' + fullProfile + ') }}');
     for (const step of workflow.jobs['e2e-status'].steps.slice(1)) expect(step.if).toBe(fullProfile);
     const selection = workflow.jobs['prepare-e2e'].steps.find((step: any) => step.id === 'select');
     const select = selection.run;

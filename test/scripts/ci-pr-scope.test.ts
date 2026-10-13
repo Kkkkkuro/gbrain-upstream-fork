@@ -25,12 +25,13 @@ function cells(job: Job, context: Record<string, unknown>): string[] {
 }
 
 const native = load('native-locks.yml').jobs;
+const upstream = { github: { repository: 'garrytan/gbrain' } };
 const nativeCells = (scope: string) => ({
-  native: cells(native.native, { inputs: { scope } }),
-  musl: cells(native.musl, { inputs: { scope } }),
-  console: cells(native['windows-backup-console'], { inputs: { scope } }),
-  dotnet: cells(native['windows-backup-dotnet'], { inputs: { scope } }),
-  openclaw: evaluate(native.openclaw.if!, { inputs: { scope } }),
+  native: cells(native.native, { ...upstream, inputs: { scope } }),
+  musl: cells(native.musl, { ...upstream, inputs: { scope } }),
+  console: cells(native['windows-backup-console'], { ...upstream, inputs: { scope } }),
+  dotnet: cells(native['windows-backup-dotnet'], { ...upstream, inputs: { scope } }),
+  openclaw: evaluate(native.openclaw.if!, { ...upstream, inputs: { scope } }),
 });
 
 function classify(files: string): string {
@@ -97,8 +98,8 @@ describe('pull-request CI scope', () => {
   });
 
   test('security and persistence matrices drop only the oldest Bun version on pull requests', () => {
-    const pr = { github: { event_name: 'pull_request' } };
-    const push = { github: { event_name: 'push' } };
+    const pr = { github: { event_name: 'pull_request', repository: 'garrytan/gbrain' } };
+    const push = { github: { event_name: 'push', repository: 'garrytan/gbrain' } };
     const security = load('test.yml').jobs['security-regressions'];
     expect(cells(security, push)).toHaveLength(6);
     expect(cells(security, pr)).toEqual(['ubuntu-latest/1.4.2', 'macos-26/1.4.2', 'windows-latest/1.4.2']);
