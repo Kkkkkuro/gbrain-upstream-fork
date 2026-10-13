@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runPostinstall } from './postinstall.ts';
+import { absolutePostinstallCommand, runPostinstall } from './postinstall.ts';
 import { patchPath, reapplySubjectInfer } from './reapply.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -47,6 +47,36 @@ describe('reapply subject-infer alias', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test('a failed apply after a successful dry-run restores the snapshot', () => {
+    const root = tree();
+    try {
+      const before = files(root);
+      const target = join(root, 'src/core/facts/subject-infer.ts');
+      const outcome = reapplySubjectInfer(root, patchPath(), () => {
+        writeFileSync(target, 'half applied\n');
+        writeFileSync(`${target}.rej`, 'reject\n');
+        return { status: 1, stdout: '', stderr: 'apply failed\n' };
+      });
+      expect(outcome.result).toBe('failed');
+      expect(outcome.output).toContain('apply failed');
+      expect(sameBytes(before, root)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('the installed postinstall command is an absolute path', () => {
+    const command = absolutePostinstallCommand();
+    const script = command.slice('bun '.length);
+    expect(command.startsWith('bun ')).toBe(true);
+    expect(isAbsolute(script)).toBe(true);
+    const pkg = JSON.parse(readFileSync(join(HERE, 'mini-global-package.json'), 'utf8')) as { scripts: { postinstall: string } };
+    const installed = pkg.scripts.postinstall.slice('bun '.length);
+    expect(pkg.scripts.postinstall.startsWith('bun ')).toBe(true);
+    expect(isAbsolute(installed)).toBe(true);
+    expect(installed.includes(`${join('overlays', 'subject-infer-alias', 'postinstall.ts')}`) || installed.endsWith('postinstall.ts')).toBe(true);
   });
 
   test('partial markers exit without patching', () => {

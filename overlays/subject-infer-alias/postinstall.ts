@@ -1,4 +1,5 @@
 import { hostname } from 'node:os';
+import { isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultInstallRoot, reapplySubjectInfer } from './reapply.ts';
 
@@ -7,6 +8,12 @@ export const MINI_HOSTNAME = 'KuroChendeMac-mini.local';
 
 export function isMiniWriter(host = hostname()): boolean {
   return host === MINI_HOSTNAME;
+}
+
+/** Absolute so `bun` can run it from `~/.bun/install/global`, where a relative overlay path does not exist. */
+export function absolutePostinstallCommand(scriptPath = fileURLToPath(import.meta.url)): string {
+  if (!isAbsolute(scriptPath)) throw new Error('postinstall script path is not absolute');
+  return `bun ${scriptPath}`;
 }
 
 export function runPostinstall(host = hostname(), root = defaultInstallRoot()): number {

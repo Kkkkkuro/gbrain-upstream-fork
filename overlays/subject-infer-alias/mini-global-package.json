@@ -1,6 +1,6 @@
 {
   "scripts": {
-    "postinstall": "bun overlays/subject-infer-alias/postinstall.ts"
+    "postinstall": "bun /Users/kurochen_macmini/src/gbrain-upstream-fork/overlays/subject-infer-alias/postinstall.ts"
   },
-  "x-kuro-install": "Mini only. Merge this scripts.postinstall into ~/.bun/install/global/package.json on KuroChendeMac-mini.local, the sole GBrain writer. Do not install it on any other machine. postinstall.ts exits 0 without reading the brain when hostname() is not that host."
+  "x-kuro-install": "Mini only. The postinstall value is an absolute path so bun can run it from ~/.bun/install/global. Do not install this hook on any other machine. A merged postinstall that also runs the backup reapply is not in the repo yet, so this command runs only the subject-infer reapply."
 }

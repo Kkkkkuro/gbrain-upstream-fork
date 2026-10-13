@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -64,6 +64,19 @@ function snapshot(root: string): Map<string, string | null> {
   return files;
 }
 
+function restore(root: string, before: Map<string, string | null>): void {
+  for (const [rel, text] of before) {
+    const path = join(root, rel);
+    if (text === null) {
+      rmSync(path, { force: true });
+      continue;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
+  }
+  for (const junk of rejectFiles(root)) rmSync(junk, { force: true });
+}
+
 function unchanged(root: string, before: Map<string, string | null>): boolean {
   for (const [rel, text] of before) {
     if (readText(root, rel) !== text) return false;
@@ -84,7 +97,11 @@ export function runPatch(root: string, patch: string, dryRun: boolean): PatchRun
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }
 
-export function reapplySubjectInfer(root: string, patch = patchPath()): { result: ReapplyResult; output: string } {
+export function reapplySubjectInfer(
+  root: string,
+  patch = patchPath(),
+  apply: (root: string, patch: string) => PatchRun = (target, patchFile) => runPatch(target, patchFile, false),
+): { result: ReapplyResult; output: string } {
   const hits = markerHits(root);
   if (hits === MARKERS.length) return { result: 'present', output: '' };
   if (hits > 0) {
@@ -97,9 +114,10 @@ export function reapplySubjectInfer(root: string, patch = patchPath()): { result
     for (const junk of rejectFiles(root)) rmSync(junk, { force: true });
     return { result: 'failed', output: dryOutput };
   }
-  const applied = runPatch(root, patch, false);
+  const applied = apply(root, patch);
   const output = `${dryOutput}${applied.stderr}${applied.stdout}`;
   if (applied.status !== 0 || markerHits(root) !== MARKERS.length || rejectFiles(root).length > 0) {
+    restore(root, before);
     return { result: 'failed', output };
   }
   return { result: 'applied', output };
