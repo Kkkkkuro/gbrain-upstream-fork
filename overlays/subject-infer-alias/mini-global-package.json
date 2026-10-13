@@ -1,6 +1,6 @@
 {
   "scripts": {
-    "postinstall": "bun /Users/kurochen_macmini/src/gbrain-upstream-fork/overlays/subject-infer-alias/postinstall.ts"
+    "postinstall": "bun /Users/kurochen_macmini/src/gbrain-upstream-fork/overlays/mini-writer/postinstall.ts"
   },
-  "x-kuro-install": "Mini only. The postinstall value is an absolute path so bun can run it from ~/.bun/install/global. Do not install this hook on any other machine. A merged postinstall that also runs the backup reapply is not in the repo yet, so this command runs only the subject-infer reapply."
+  "x-kuro-install": "Mini only. This absolute path is the shared hook in overlays/mini-writer/postinstall.ts. It checks KuroChendeMac-mini.local, then runs the backup reapply and the subject-infer reapply. Do not install a second hook."
 }

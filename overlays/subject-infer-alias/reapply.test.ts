@@ -3,7 +3,8 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, stat
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { absolutePostinstallCommand, runPostinstall } from './postinstall.ts';
+import { isMiniWriter } from '../mini-writer/host.ts';
+import { postinstallCommand, runCombinedPostinstall } from '../mini-writer/postinstall.ts';
 import { patchPath, reapplySubjectInfer } from './reapply.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -67,16 +68,18 @@ describe('reapply subject-infer alias', () => {
     }
   });
 
-  test('the installed postinstall command is an absolute path', () => {
-    const command = absolutePostinstallCommand();
+  test('the installed postinstall command is the shared absolute hook', () => {
+    const command = postinstallCommand();
     const script = command.slice('bun '.length);
     expect(command.startsWith('bun ')).toBe(true);
     expect(isAbsolute(script)).toBe(true);
+    expect(script.endsWith(join('overlays', 'mini-writer', 'postinstall.ts'))).toBe(true);
     const pkg = JSON.parse(readFileSync(join(HERE, 'mini-global-package.json'), 'utf8')) as { scripts: { postinstall: string } };
     const installed = pkg.scripts.postinstall.slice('bun '.length);
-    expect(pkg.scripts.postinstall.startsWith('bun ')).toBe(true);
     expect(isAbsolute(installed)).toBe(true);
-    expect(installed.includes(`${join('overlays', 'subject-infer-alias', 'postinstall.ts')}`) || installed.endsWith('postinstall.ts')).toBe(true);
+    expect(installed.endsWith(join('overlays', 'mini-writer', 'postinstall.ts'))).toBe(true);
+    expect(isMiniWriter('KuroChendeMac-mini.local')).toBe(true);
+    expect(isMiniWriter('not-the-mini')).toBe(false);
   });
 
   test('partial markers exit without patching', () => {
@@ -104,21 +107,21 @@ describe('reapply subject-infer alias', () => {
       expect(outcome.result).toBe('failed');
       expect(outcome.output.length).toBeGreaterThan(0);
       expect(sameBytes(before, root)).toBe(true);
-      expect(runPostinstall('not-the-mini', root)).toBe(0);
+      expect(runCombinedPostinstall('not-the-mini')).toBe(0);
       expect(sameBytes(before, root)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test('postinstall on the Mini reports failure when upstream bytes do not match', () => {
+  test('bad upstream bytes stay unchanged when reapply fails', () => {
     const root = tree();
     try {
       mkdirSync(join(root, 'src/core/facts'), { recursive: true });
       writeFileSync(join(root, 'src/core/facts/subject-infer.ts'), 'not upstream\n');
       writeFileSync(join(root, 'test/facts-subject-infer.test.ts'), 'not upstream\n');
       const before = files(root);
-      expect(runPostinstall('KuroChendeMac-mini.local', root)).toBe(1);
+      expect(reapplySubjectInfer(root, patchPath()).result).toBe('failed');
       expect(sameBytes(before, root)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
