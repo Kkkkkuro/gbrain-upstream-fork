@@ -5,9 +5,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { INSTALL_SCOPE, isMiniWriter } from './host.ts';
 
-const REAPPLY = [
+export const REAPPLY = [
   'overlays/backup-pending-continuation/reapply.ts',
   'overlays/subject-infer-alias/reapply.ts',
+  'overlays/nightly-fixture-city/reapply.ts',
 ] as const;
 
 export function repoRoot(): string {
