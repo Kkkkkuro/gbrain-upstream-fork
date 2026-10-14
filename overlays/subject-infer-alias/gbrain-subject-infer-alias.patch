@@ -1,0 +1,110 @@
+--- a/src/core/facts/subject-infer.ts
++++ b/src/core/facts/subject-infer.ts
+@@ -109,6 +109,7 @@
+ 
+ /** Slugs written verbatim in the fact text ("people/alice-example owns the checklist"). */
+ const SLUG_IN_TEXT_RE = /(?<![\w/-])[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*)+(?![\w/-])/g;
++const ENTITY_DIR_SLUG = /^(?:people|companies|funds|orgs|organizations|hosts|projects|concepts|deals)\//i;
+ 
+ /** Two distinct entities already make the subject unknown; more resolution is wasted work. */
+ const DISTINCT_ENTITY_LIMIT = 2;
+@@ -141,9 +142,23 @@
+     // evidence; anything else unresolved is a real competing reference.
+     if (r.miss === 'not_entity') continue;
+     if (r.miss === 'no_page' && (isNonName(candidate.query) || (candidate.sentenceStart && SENTENCE_OPENERS.has(candidate.query.toLowerCase())))) continue;
++    // "file/database" matches the slug scanner and is not an entity directory.
++    // A missing people/ or companies/ slug still competes.
++    if (r.miss === 'no_page' && candidate.query.includes('/') && !ENTITY_DIR_SLUG.test(candidate.query)) continue;
+     vetoed = true;
+   }
+ 
++  // Registered aliases are often longer than the extractor's four-token cap, or
++  // lowercase, so they never become a strong candidate. A miss does not veto:
++  // only an alias that names one live fact-entity page counts. Write time uses
++  // the same lookup so a page import does not save the fact with no subject.
++  if (input.mode === 'relink' || input.mode === 'write') {
++    for (const slug of await aliasSlugsContained(engine, sourceId, input.fact, input.excludePrivate)) {
++      resolved.add(slug);
++      if (resolved.size >= DISTINCT_ENTITY_LIMIT) return { slug: null, reason: 'ambiguous', resolved: [...resolved] };
++    }
++  }
++
+   const page = input.pageSlug ? await liveFactEntityPage(engine, sourceId, input.pageSlug, input.excludePrivate) : null;
+   if (page) {
+     if (vetoed || (resolved.size === 1 && !resolved.has(page))) return { slug: null, reason: 'ambiguous', resolved: [...resolved] };
+@@ -168,6 +183,30 @@
+   return isCommonCapitalizedWord(query) || ROLE_AND_TERM_TOKENS.has(query.toLowerCase());
+ }
+ 
++function aliasOccurs(fact: string, alias: string): boolean {
++  const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++  return new RegExp(`(?<![\\p{L}\\p{N}_-])${escaped}(?![\\p{L}\\p{N}_-])`, 'iu').test(fact);
++}
++
++/** Fact-entity pages whose registered alias occurs as a whole name in the fact. */
++async function aliasSlugsContained(engine: BrainEngine, sourceId: string, fact: string, excludePrivate?: boolean): Promise<string[]> {
++  const privacy = excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : '';
++  const rows = await engine.executeRaw<{ slug: string; type: string | null; alias: string }>(
++    `SELECT p.slug, p.type, COALESCE(a.alias_text, a.alias_norm) AS alias
++       FROM page_aliases a
++       JOIN pages p ON p.source_id = a.source_id AND p.slug = a.slug AND p.deleted_at IS NULL
++      WHERE a.source_id = $1 AND length(COALESCE(a.alias_text, a.alias_norm)) >= 3
++        AND position(lower(COALESCE(a.alias_text, a.alias_norm)) in lower($2)) > 0 ${privacy}`,
++    [sourceId, fact],
++  );
++  const slugs = new Set<string>();
++  for (const row of rows) {
++    if (!row.alias || !isFactEntityPage(row.slug, row.type) || !aliasOccurs(fact, row.alias)) continue;
++    slugs.add(row.slug);
++  }
++  return [...slugs];
++}
++
+ async function liveFactEntityPage(engine: BrainEngine, sourceId: string, slug: string, excludePrivate?: boolean): Promise<string | null> {
+   const privacy = excludePrivate ? `AND ${privatePagesFilterFragment('p')}` : '';
+   const [row] = await engine.executeRaw<{ slug: string; type: string | null }>(
+--- a/test/facts-subject-infer.test.ts
++++ b/test/facts-subject-infer.test.ts
+@@ -155,6 +155,42 @@
+     expect(await inferFactSubject(engine, 'default', { fact: 'slept 7 hours', mode: 'write' }))
+       .toMatchObject({ slug: null, reason: 'no_mention' });
+   });
++  test('a prose slash does not veto one registered alias, and a hyphenated token is not that alias', async () => {
++    await page('projects/gbrain-example', 'GBrain Example', 'project', 'aliases:\n  - "gbrain"\n');
++    try {
++      const linked = await inferFactSubject(engine, 'default', {
++        fact: 'kept gbrain online after the file/database drift', mode: 'relink',
++      });
++      expect(linked).toEqual({ slug: 'projects/gbrain-example', via: 'mention' });
++      const atWrite = await inferFactSubject(engine, 'default', {
++        fact: 'kept gbrain online after the file/database drift', mode: 'write',
++      });
++      expect(atWrite).toEqual({ slug: 'projects/gbrain-example', via: 'mention' });
++      const hyphen = await inferFactSubject(engine, 'default', {
++        fact: 'the gbrain-main checkout was archived', mode: 'relink',
++      });
++      expect(hyphen.slug).toBeNull();
++    } finally {
++      await engine.executeRaw(`DELETE FROM pages WHERE slug = 'projects/gbrain-example'`);
++    }
++  });
++
++  test('relink links a registered alias the extractor does not emit whole', async () => {
++    await page('projects/long-alias-example', 'Long Alias Example', 'project', 'aliases:\n  - "local deployment cutover ledger"\n');
++    try {
++      const atWrite = await inferFactSubject(engine, 'default', {
++        fact: 'kept the local deployment cutover ledger on one host', mode: 'write',
++      });
++      expect(atWrite).toEqual({ slug: 'projects/long-alias-example', via: 'mention' });
++      const linked = await inferFactSubject(engine, 'default', {
++        fact: 'kept the local deployment cutover ledger on one host', mode: 'relink',
++      });
++      expect(linked).toEqual({ slug: 'projects/long-alias-example', via: 'mention' });
++    } finally {
++      await engine.executeRaw(`DELETE FROM pages WHERE slug = 'projects/long-alias-example'`);
++    }
++  });
++
+   test('mention and page tiers are labeled', async () => {
+     expect(await inferFactSubject(engine, 'default', { fact: 'Acme Example raised a seed round', mode: 'write' }))
+       .toEqual({ slug: 'companies/acme-example', via: 'mention' });

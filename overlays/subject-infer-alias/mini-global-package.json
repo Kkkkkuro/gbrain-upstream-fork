@@ -1,0 +1,6 @@
+{
+  "scripts": {
+    "postinstall": "bun /Users/kurochen_macmini/src/gbrain-upstream-fork/overlays/mini-writer/postinstall.ts"
+  },
+  "x-kuro-install": "Mini only. This absolute path is the shared hook in overlays/mini-writer/postinstall.ts. It checks KuroChendeMac-mini.local, then runs the backup reapply and the subject-infer reapply. Do not install a second hook."
+}
