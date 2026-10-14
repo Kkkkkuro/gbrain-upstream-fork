@@ -12,7 +12,7 @@ const workflow = safeLoad(readFileSync(join(import.meta.dir, '../../.github/work
   concurrency: { group: string; 'cancel-in-progress': boolean }; jobs: Record<string, Job>;
 };
 function context(event: string, flag?: boolean) {
-  return { github: { workflow: 'Test', event_name: event, ref: 'refs/heads/example', event: { pull_request: event === 'pull_request' ? { number: 123 } : {} } },
+  return { github: { repository: 'garrytan/gbrain', workflow: 'Test', event_name: event, ref: 'refs/heads/example', event: { pull_request: event === 'pull_request' ? { number: 123 } : {} } },
     inputs: { native_only: flag }, always: () => true };
 }
 function evaluate(expression: string, event: string, flag?: boolean): unknown {
@@ -26,8 +26,8 @@ describe('native-only CI remains separate from full validation', () => {
   test('only an explicit manual boolean skips full jobs; default and PR/push gates stay required', () => {
     expect(workflow.on.workflow_dispatch.inputs.native_only).toMatchObject({ type: 'boolean', default: false });
     expect(workflow.jobs['native-locks'].uses).toBe('./.github/workflows/native-locks.yml');
-    expect(workflow.jobs['native-locks'].if).toBeUndefined();
-    expect(workflow.jobs.changes.if).toBeUndefined();
+    expect(workflow.jobs['native-locks'].if).toBe("github.repository == 'garrytan/gbrain'");
+    expect(workflow.jobs.changes.if).toBe("github.repository == 'garrytan/gbrain'");
     expect(workflow.jobs['native-locks'].needs).toEqual(['changes']);
     for (const [name, job] of Object.entries(workflow.jobs)) {
       if (name === 'native-locks' || name === 'changes') continue;

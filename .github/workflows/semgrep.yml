@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   semgrep:
+    if: github.repository == 'garrytan/gbrain'
     runs-on: ubicloud-standard-4-ubuntu-2404
     timeout-minutes: 20
     container:
