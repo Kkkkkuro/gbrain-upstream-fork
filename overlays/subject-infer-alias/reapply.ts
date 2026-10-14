@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,55 +33,51 @@ export function markerHits(root: string): number {
   return MARKERS.filter(([rel, text]) => readText(root, rel)?.includes(text) === true).length;
 }
 
-function rejectFiles(root: string): string[] {
-  const found: string[] = [];
-  const walk = (dir: string) => {
-    let entries: ReturnType<typeof readdirSync>;
-    try {
-      entries = readdirSync(dir);
-    } catch {
-      return;
-    }
-    for (const name of entries) {
-      const path = join(dir, name);
-      let info: ReturnType<typeof statSync>;
-      try {
-        info = statSync(path);
-      } catch {
-        continue;
-      }
-      if (info.isDirectory()) walk(path);
-      else if (name.endsWith('.rej') || name.endsWith('.orig')) found.push(path);
-    }
-  };
-  walk(root);
-  return found;
+const TOUCHED = [...new Set(MARKERS.map(([rel]) => rel))];
+const SIDECAR_SUFFIXES = ['.rej', '.orig'] as const;
+
+interface Snapshot {
+  files: Map<string, string | null>;
+  sidecars: Map<string, string | null>;
 }
 
-function snapshot(root: string): Map<string, string | null> {
+function snapshot(root: string): Snapshot {
   const files = new Map<string, string | null>();
-  for (const [rel] of MARKERS) files.set(rel, readText(root, rel));
-  return files;
-}
-
-function restore(root: string, before: Map<string, string | null>): void {
-  for (const [rel, text] of before) {
-    const path = join(root, rel);
-    if (text === null) {
-      rmSync(path, { force: true });
-      continue;
-    }
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, text);
+  const sidecars = new Map<string, string | null>();
+  for (const rel of TOUCHED) {
+    files.set(rel, readText(root, rel));
+    for (const suffix of SIDECAR_SUFFIXES) sidecars.set(rel + suffix, readText(root, rel + suffix));
   }
-  for (const junk of rejectFiles(root)) rmSync(junk, { force: true });
+  return { files, sidecars };
 }
 
-function unchanged(root: string, before: Map<string, string | null>): boolean {
-  for (const [rel, text] of before) {
+function restore(root: string, before: Snapshot): void {
+  for (const [rel, text] of before.files) {
+    const path = join(root, rel);
+    if (text === null) rmSync(path, { force: true });
+    else {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, text);
+    }
+  }
+  for (const [rel, text] of before.sidecars) {
+    if (text !== null) continue;
+    rmSync(join(root, rel), { force: true });
+  }
+}
+
+function createdSidecar(root: string, before: Snapshot): boolean {
+  for (const [rel, text] of before.sidecars) {
+    if (text === null && readText(root, rel) !== null) return true;
+  }
+  return false;
+}
+
+function unchanged(root: string, before: Snapshot): boolean {
+  for (const [rel, text] of before.files) {
     if (readText(root, rel) !== text) return false;
   }
-  return rejectFiles(root).length === 0;
+  return !createdSidecar(root, before);
 }
 
 export interface PatchRun {
@@ -111,12 +107,12 @@ export function reapplySubjectInfer(
   const dry = runPatch(root, patch, true);
   const dryOutput = `${dry.stderr}${dry.stdout}`;
   if (dry.status !== 0 || !unchanged(root, before)) {
-    for (const junk of rejectFiles(root)) rmSync(junk, { force: true });
+    restore(root, before);
     return { result: 'failed', output: dryOutput };
   }
   const applied = apply(root, patch);
   const output = `${dryOutput}${applied.stderr}${applied.stdout}`;
-  if (applied.status !== 0 || markerHits(root) !== MARKERS.length || rejectFiles(root).length > 0) {
+  if (applied.status !== 0 || markerHits(root) !== MARKERS.length || createdSidecar(root, before)) {
     restore(root, before);
     return { result: 'failed', output };
   }

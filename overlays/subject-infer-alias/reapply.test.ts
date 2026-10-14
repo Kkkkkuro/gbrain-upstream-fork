@@ -50,6 +50,26 @@ describe('reapply subject-infer alias', () => {
     }
   });
 
+  test('a failed apply keeps a pre-existing unrelated orig', () => {
+    const root = tree();
+    try {
+      const unrelated = join(root, 'x.orig');
+      writeFileSync(unrelated, 'keep me\n');
+      const kept = readFileSync(unrelated);
+      const target = join(root, 'src/core/facts/subject-infer.ts');
+      const outcome = reapplySubjectInfer(root, patchPath(), () => {
+        writeFileSync(target, 'half applied\n');
+        writeFileSync(`${target}.rej`, 'reject\n');
+        return { status: 1, stdout: '', stderr: 'apply failed\n' };
+      });
+      expect(outcome.result).toBe('failed');
+      expect(readFileSync(unrelated).equals(kept)).toBe(true);
+      expect(readFileSync(target, 'utf8')).not.toBe('half applied\n');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('a failed apply after a successful dry-run restores the snapshot', () => {
     const root = tree();
     try {
