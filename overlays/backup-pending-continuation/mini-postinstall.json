@@ -1,0 +1,7 @@
+{
+  "install_on": "Mini only. Mini is the only writer. The postinstall command is installed by overlays/mini-writer/postinstall.ts, which runs both reapply scripts. Do not set scripts.postinstall to a single overlay from this file.",
+  "shared_module": "overlays/mini-writer/host.ts",
+  "scripts": {
+    "postinstall": "bun overlays/mini-writer/postinstall.ts"
+  }
+}
