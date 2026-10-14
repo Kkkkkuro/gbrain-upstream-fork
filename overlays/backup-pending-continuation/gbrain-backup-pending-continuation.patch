@@ -1,0 +1,459 @@
+--- a/src/core/backup/status-file.ts
++++ b/src/core/backup/status-file.ts
+@@ -9,13 +9,16 @@
+  * helpers, and the PURE policy functions from skillpack/nag-state.ts only.
+  * Compute lives in backup/coverage.ts (engine-side).
+  *
+- * Two machine-owned files under the gbrain home (atomic tmp+rename, 0600,
++ * Machine-owned files under the gbrain home (atomic tmp+rename, 0600,
+  * fail-open on corrupt — a broken state file must never break a session):
+  *
+  *   backup-status.json    the cached BackupStatus verdict. Written ONLY by a
+  *                         successful probed compute (coverage.ts); deleted by
+  *                         invalidateBackupStatus() on fix paths (bootstrap
+  *                         repo / sources harden / sources push success).
++ *   backup-status.json.generation invalidation token, retained across cache removal.
++ *   backup-status.json.remote-claims attempted identity fingerprints for one remote cycle.
++ *   backup-status.json.lock native coordinator lock, never unlinked by invalidation.
+  *   backup-nag-state.json bounded-nag state. OWN schema (gbrain-backup-nag-v1)
+  *                         — NOT skillpack's: loadNagState() reconstructs only
+  *                         {schema_version, entries} on load, so the dampener /
+@@ -38,6 +41,7 @@
+ 
+ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+ import { dirname } from 'node:path';
++import { randomUUID } from 'node:crypto';
+ 
+ import { gbrainPath, loadConfigFileOnly } from '../config.ts';
+ import {
+@@ -75,6 +79,8 @@
+     /** Why an `unavailable` probe failed: the full two-second slot ran out, or git exited with an error. */
+     cause?: 'timeout' | 'exit';
+     checked_at?: string;
++    /** A claimed probe with no durable answer remains unverified until the next cycle. */
++    attempted_at?: string;
+     local_commit?: string;
+     remote_commit?: string;
+     repository_fingerprint?: string;
+@@ -110,6 +116,8 @@
+    */
+   degraded?: boolean;
+   remote_check_at?: string;
++  /** Binds persisted evidence to fix-path invalidation, including in-flight computes. */
++  cache_generation?: string;
+   recovery_scope?: string;
+   /**
+    * E7: how much the brain holds and since when, measured with the verdict.
+@@ -134,6 +142,32 @@
+ }
+ 
+ export const BACKUP_VERIFICATION_MAX_AGE_MS = 60 * 60 * 1000;
++
++/** True when a later tick may finish budget_exhausted remotes without opening a new full sweep. */
++export function pendingBackupContinuationEligible(cached: BackupStatus | null, now = Date.now()): boolean {
++  if (!cached || cached.degraded === true || backupCheckDisabled()) return false;
++  if (isBackupStatusStale(cached, now)) return false;
++  const remoteAge = now - Date.parse(cached.remote_check_at ?? '');
++  if (!Number.isFinite(remoteAge) || remoteAge < 0 || remoteAge > BACKUP_VERIFICATION_MAX_AGE_MS) return false;
++  const cacheAge = now - Date.parse(cached.checked_at);
++  if (!Number.isFinite(cacheAge) || cacheAge < 0) return false;
++  return cached.assets.some((asset) => asset.configured_remote === true
++    && asset.verification?.state === 'budget_exhausted'
++    && asset.verification.attempted_at == null);
++}
++
++/** Missing claims are eligible. A present but unreadable claims file fails closed. */
++export function backupRemoteClaimsAllowContinuation(now = Date.now()): boolean {
++  const path = `${backupStatusPath()}.remote-claims`;
++  try {
++    const raw = JSON.parse(readFileSync(path, 'utf8')) as { generation?: unknown; started_at?: unknown; keys?: unknown };
++    if (!raw || typeof raw.generation !== 'string' || typeof raw.started_at !== 'string'
++      || !Array.isArray(raw.keys) || !raw.keys.every((key) => typeof key === 'string')) return false;
++    return Number.isFinite(now - Date.parse(raw.started_at));
++  } catch (error) {
++    return (error as NodeJS.ErrnoException).code === 'ENOENT';
++  }
++}
+ export const BACKUP_RECOVERY_SCOPE = 'Git evidence covers committed repository files only; not a full database backup. DB-only pages, facts, configuration and credentials need a separate backup and restore drill.';
+ 
+ /** Repository-shaped assets: the ones whose recovery is verified against a remote. */
+@@ -204,6 +238,7 @@
+ // ── Paths (test seams follow the nag-state.ts idiom) ────────────────────────
+ 
+ let statusPathOverride: string | null = null;
++let invalidationFailed = false;
+ let nagStatePathOverride: string | null = null;
+ let intervalOverrideMs: number | null = null;
+ 
+@@ -212,6 +247,7 @@
+ }
+ export function __setBackupStatusPathForTests(p: string | null): void {
+   statusPathOverride = p;
++  invalidationFailed = false;
+ }
+ 
+ export function backupNagStatePath(): string {
+@@ -315,25 +351,84 @@
+     ) {
+       return null;
+     }
++    if ((raw.cache_generation ?? '') !== backupGeneration()) return null;
+     return raw as BackupStatus;
+   } catch {
+     return null;
+   }
+ }
+ 
+-export function saveBackupStatus(s: BackupStatus): void {
+-  atomicWriteJson(backupStatusPath(), s);
++/** Missing is the legacy generation; unreadable/corrupt is NOT a valid generation. */
++export function backupGeneration(): string {
++  if (invalidationFailed) throw new Error('Backup invalidation failed; cached evidence must not be used');
++  const path = `${backupStatusPath()}.generation`;
++  try {
++    const value = JSON.parse(readFileSync(path, 'utf8'));
++    if (typeof value !== 'string' || !value) throw new Error('Invalid backup generation');
++    return value;
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
++    throw error;
++  }
+ }
+ 
++export function saveBackupStatus(s: BackupStatus, generation = backupGeneration()): void {
++  if (generation !== backupGeneration()) throw new Error('Backup evidence invalidated during compute');
++  const persisted = { ...s };
++  if (generation) persisted.cache_generation = generation;
++  else delete persisted.cache_generation;
++  atomicWriteJson(backupStatusPath(), persisted);
++  // An invalidation between the check and rename is safe: readers compare the
++  // embedded generation, rather than trusting that the final rename won.
++}
++
++interface RemoteProbeClaims {
++  generation: string;
++  started_at: string;
++  keys: string[];
++}
++
++/** Call only while holding the host backup native lock. No result is invented. */
++export function claimBackupRemoteProbe(key: string, now: Date, generation: string, reset = false): boolean {
++  if (generation !== backupGeneration()) throw new Error('Backup probe invalidated');
++  const path = `${backupStatusPath()}.remote-claims`;
++  let claims: RemoteProbeClaims = { generation, started_at: now.toISOString(), keys: [] };
++  try {
++    const raw = JSON.parse(readFileSync(path, 'utf8')) as RemoteProbeClaims;
++    if (!raw || typeof raw.generation !== 'string' || typeof raw.started_at !== 'string'
++      || !Array.isArray(raw.keys) || !raw.keys.every(k => typeof k === 'string')) throw new Error('Invalid backup probe claims');
++    const age = now.getTime() - Date.parse(raw.started_at);
++    if (!Number.isFinite(age)) throw new Error('Invalid backup probe claim timestamp');
++    if (!reset && raw.generation === generation && age >= 0 && age <= BACKUP_VERIFICATION_MAX_AGE_MS) claims = raw;
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
++  }
++  if (claims.keys.includes(key)) return false;
++  claims.keys.push(key);
++  atomicWriteJson(path, claims);
++  if (generation !== backupGeneration()) throw new Error('Backup probe invalidated');
++  return true;
++}
++
+ /**
+  * Fix-path invalidation: called on `bootstrap repo` / `sources harden` /
+  * `sources push` success so a fixed repo stops nagging immediately instead of
+  * at the next 30-day recompute. Best-effort — never throws.
+  */
+ export function invalidateBackupStatus(): void {
++  // A never-used backup cache is a no-op, including when its home does not exist.
++  // A lock file may belong to an in-flight compute; retaining it is conservative.
++  const path = backupStatusPath();
++  if (![path, `${path}.remote-claims`, `${path}.lock`].some(existsSync)) return;
+   try {
++    atomicWriteJson(`${backupStatusPath()}.generation`, randomUUID());
++    invalidationFailed = false;
+     rmSync(backupStatusPath(), { force: true });
+-  } catch {}
++  } catch {
++    invalidationFailed = true;
++    try { rmSync(backupStatusPath(), { force: true }); } catch {}
++    process.stderr.write('[backup] could not persist cache invalidation; this process will not reuse cached evidence. Other running processes may retain stale evidence until storage is repaired.\n');
++  }
+ }
+ 
+ /**
+--- a/src/core/backup/coverage.ts
++++ b/src/core/backup/coverage.ts
+@@ -28,6 +28,9 @@
+ import { loadBridgeState } from '../skillpack/bridge-state.ts';
+ import { loadStorageConfig } from '../storage-config.ts';
+ import {
++  backupStatusPath,
++  backupGeneration,
++  claimBackupRemoteProbe,
+   BACKUP_INTERVAL_DAYS_DEFAULT,
+   BACKUP_STATUS_SCHEMA_VERSION,
+   backupCheckDisabled,
+@@ -40,10 +43,13 @@
+   assetBlocksRecovery,
+   BACKUP_VERIFICATION_MAX_AGE_MS,
+   BACKUP_RECOVERY_SCOPE,
++  backupRemoteClaimsAllowContinuation,
++  pendingBackupContinuationEligible,
+   type BackupAssetVerdict,
+   type BackupComputedBy,
+   type BackupStatus,
+ } from './status-file.ts';
++import { tryAcquireNativeLock } from '../persistence/native-lock.ts';
+ import { assessBackupRepository, BACKUP_REMOTE_PROBE_CAP, budgetAllowsProbe, type RemoteProbeBudget } from './repository.ts';
+ 
+ /** No silent caps: at most this many deduped git roots are probed per run;
+@@ -59,6 +65,11 @@
+   localGitProbes: boolean;
+   verifyRemoteRefs?: boolean;
+   previousStatus?: BackupStatus;
++  /** Internal host coordinator: never supplied by remote callers. */
++  continueRemoteSweep?: boolean;
++  claimRemoteProbe?: (key: string) => boolean;
++  /** Finish budget_exhausted remotes only. A failed re-check must not start a full sweep. */
++  pendingOnly?: boolean;
+   /** Provenance stamp for the status file (default 'cli'). */
+   computedBy?: BackupComputedBy;
+ }
+@@ -141,7 +152,7 @@
+   const now = opts.now ?? new Date();
+   const assets: BackupAssetVerdict[] = [];
+   const remoteBudget: RemoteProbeBudget | undefined = opts.localGitProbes === true && opts.verifyRemoteRefs === true
+-    ? { remaining: BACKUP_REMOTE_PROBE_CAP } : undefined;
++    ? { remaining: BACKUP_REMOTE_PROBE_CAP, claim: opts.claimRemoteProbe } : undefined;
+   const previousAge = now.getTime() - Date.parse(opts.previousStatus?.checked_at ?? '');
+   const previous = opts.localGitProbes === true && opts.previousStatus && !opts.previousStatus.degraded
+     && Number.isFinite(previousAge) && previousAge >= 0 && !isBackupStatusStale(opts.previousStatus, now.getTime())
+@@ -323,6 +334,12 @@
+     });
+     for (const { root, index } of ordered) {
+       const asset = assets[index];
++      if (opts.continueRemoteSweep) {
++        const age = now.getTime() - Date.parse(asset.verification?.checked_at ?? asset.verification?.attempted_at ?? '');
++        if (Number.isFinite(age) && age >= 0 && age <= BACKUP_VERIFICATION_MAX_AGE_MS
++          && (['verified', 'unavailable', 'missing_ref', 'mismatch'].includes(asset.verification?.state ?? '')
++            || asset.verification?.attempted_at !== undefined)) continue;
++      }
+       if (!budgetAllowsProbe(remoteBudget)) {
+         if (asset.verification?.state !== 'verified') {
+           asset.verification = { ...asset.verification, state: 'budget_exhausted' };
+@@ -404,7 +421,8 @@
+     totals,
+     assets,
+     ...(degraded ? { degraded: true } : {}),
+-    ...(remoteBudget ? { remote_check_at: now.toISOString() } : {}),
++    ...(remoteBudget ? { remote_check_at: opts.continueRemoteSweep ? previous?.remote_check_at ?? now.toISOString() : now.toISOString() }
++      : previous?.remote_check_at ? { remote_check_at: previous.remote_check_at } : {}),
+     recovery_scope: BACKUP_RECOVERY_SCOPE,
+     ...(maturity ? { maturity } : {}),
+   }, now.getTime());
+@@ -431,32 +449,71 @@
+   opts: BackupCoverageOpts & { forceRefresh?: boolean },
+ ): Promise<BackupStatus> {
+   const hostBrain = operatingOnHostBrain();
+-  const cached = hostBrain ? loadBackupStatus() : null;
+-  const nowMs = (opts.now ?? new Date()).getTime();
+-  const remoteAge = nowMs - Date.parse(cached?.remote_check_at ?? '');
+-  const remoteDue = opts.localGitProbes === true && opts.verifyRemoteRefs === true
+-    && (!Number.isFinite(remoteAge) || remoteAge < 0 || remoteAge > BACKUP_VERIFICATION_MAX_AGE_MS);
+-  if (!opts.forceRefresh && cached && !isBackupStatusStale(cached, nowMs) && !remoteDue) return currentBackupEvidence(cached, nowMs);
++  if (!hostBrain || !opts.localGitProbes) {
++    const cached = hostBrain ? loadBackupStatus() : null;
++    if (cached && !opts.forceRefresh && !isBackupStatusStale(cached, (opts.now ?? new Date()).getTime())) return currentBackupEvidence(cached, (opts.now ?? new Date()).getTime());
++    // Mounted explicit probes keep their existing behavior, but never use host coordination.
++    return computeBackupCoverage(engine, opts);
++  }
++  const lock = await tryAcquireNativeLock(`${backupStatusPath()}.lock`);
++  if (!lock) {
++    const cached = loadBackupStatus();
++    if (cached) return currentBackupEvidence({ ...cached, degraded: true }, (opts.now ?? new Date()).getTime());
++    return { ...await computeBackupCoverage(engine, { ...opts, verifyRemoteRefs: false }), degraded: true };
++  }
+   try {
+-    const fresh = await computeBackupCoverage(engine, { ...opts, previousStatus: cached ?? undefined });
+-    if (fresh.degraded && cached) return currentBackupEvidence({ ...cached, degraded: true }, nowMs);
+-    if (opts.localGitProbes && !fresh.degraded && hostBrain) {
+-      // The save gets its own guard: a failed WRITE (disk full) must not
+-      // discard the fresh verdict the caller just probed for.
+-      try {
+-        saveBackupStatus(fresh);
+-      } catch {
+-        process.stderr.write('[backup] could not persist the verdict cache (continuing with the fresh result)\n');
+-      }
+-      process.stderr.write(
+-        `[backup] checked ${fresh.totals.assets} asset(s): ${fresh.totals.no_remote} without a git remote (computed_by=${fresh.computed_by})\n`,
+-      );
++    const generation = backupGeneration();
++    const cached = loadBackupStatus();
++    const nowMs = (opts.now ?? new Date()).getTime();
++    const remoteAge = nowMs - Date.parse(cached?.remote_check_at ?? '');
++    const remoteDue = opts.localGitProbes === true && opts.verifyRemoteRefs === true
++      && (!Number.isFinite(remoteAge) || remoteAge < 0 || remoteAge > BACKUP_VERIFICATION_MAX_AGE_MS);
++    const pending = cached?.assets.some(a => a.verification?.state === 'budget_exhausted') === true;
++    const cacheAge = nowMs - Date.parse(cached?.checked_at ?? '');
++    const continuation = opts.verifyRemoteRefs === true && !remoteDue && pending
++      && !!cached && !cached.degraded && !isBackupStatusStale(cached, nowMs) && cacheAge >= 0;
++    if (opts.pendingOnly && !continuation) {
++      if (cached) return currentBackupEvidence(cached, nowMs);
++      throw new Error('pending-only backup continuation has no cache');
+     }
+-    return fresh;
+-  } catch (err) {
+-    if (cached) return currentBackupEvidence({ ...cached, degraded: true }, nowMs);
+-    throw err;
+-  }
++    if (!opts.forceRefresh && cached && !isBackupStatusStale(cached, nowMs) && !remoteDue && !continuation) return currentBackupEvidence(cached, nowMs);
++    try {
++      let coordinationFailed = false;
++      let resetClaims = opts.forceRefresh === true && cached !== null && !continuation;
++      const fresh = await computeBackupCoverage(engine, { ...opts, now: new Date(nowMs), previousStatus: cached ?? undefined, continueRemoteSweep: continuation,
++        claimRemoteProbe: opts.verifyRemoteRefs !== true ? undefined : (key) => {
++          try {
++            if (coordinationFailed) throw new Error('Backup coordination already failed');
++            const claimed = claimBackupRemoteProbe(key, opts.now ?? new Date(), generation, resetClaims);
++            resetClaims = false;
++            return claimed;
++          } catch (error) { coordinationFailed = true; throw error; }
++        },
++      });
++      if (coordinationFailed || backupGeneration() !== generation) fresh.degraded = true;
++      if (fresh.degraded && cached) return currentBackupEvidence({ ...cached, degraded: true }, nowMs);
++      if (opts.localGitProbes && !fresh.degraded && hostBrain) {
++        // The save gets its own guard: a failed WRITE (disk full) must not
++        // discard the fresh verdict the caller just probed for.
++        try {
++          saveBackupStatus(fresh, generation);
++        } catch {
++          // Invalidated evidence is different from a disk-full cache write:
++          // the former must not escape as a live verified/OK verdict.
++          try { if (backupGeneration() !== generation) fresh.degraded = true; }
++          catch { fresh.degraded = true; }
++          process.stderr.write('[backup] could not persist the verdict cache (continuing with the current evidence)\n');
++        }
++        process.stderr.write(
++          `[backup] checked ${fresh.totals.assets} asset(s): ${fresh.totals.no_remote} without a git remote (computed_by=${fresh.computed_by})\n`,
++        );
++      }
++      return currentBackupEvidence(fresh, nowMs);
++    } catch (err) {
++      if (cached) return currentBackupEvidence({ ...cached, degraded: true }, nowMs);
++      throw err;
++    }
++  } finally { await lock.release(); }
+ }
+ 
+ // ── Serve-side in-process refresher (stdio transport ONLY) ──────────────────
+@@ -513,3 +570,15 @@
+     /* never break dispatch over a refresher */
+   }
+ }
++
++/** One autopilot tick. No-ops unless a fresh cache still has an unattempted budget_exhausted remote. */
++export async function continuePendingBackupOnce(engine: BrainEngine, signal?: AbortSignal): Promise<'skipped' | 'ran'> {
++  if (signal?.aborted || backupCheckDisabled() || !operatingOnHostBrain()) return 'skipped';
++  if (!backupRemoteClaimsAllowContinuation()) {
++    process.stderr.write('[backup] pending continuation refused: remote claims file is unreadable\n');
++    return 'skipped';
++  }
++  if (!pendingBackupContinuationEligible(loadBackupStatus())) return 'skipped';
++  await getBackupStatus(engine, { localGitProbes: true, verifyRemoteRefs: true, pendingOnly: true });
++  return 'ran';
++}
+--- a/src/commands/autopilot-daemon.ts
++++ b/src/commands/autopilot-daemon.ts
+@@ -12,6 +12,7 @@
+ import { join } from 'path';
+ import { loadPreferences } from '../core/preferences.ts';
+ import { registerCleanup } from '../core/process-cleanup.ts';
++import { continuePendingBackupOnce } from '../core/backup/coverage.ts';
+ import { dispatchAutopilotTick } from './autopilot-dispatch.ts';
+ import { runNightlyQualityProbeStep, runParserProbeStep } from './autopilot-probes.ts';
+ import { resolveChildCliInvocation } from '../core/minions/job-isolation.ts';
+@@ -310,6 +311,12 @@
+     await attemptAutopilotSelfUpgrade(engine, engineType, lockPath, () => !configurationBlocked());
+     if (configurationBlocked()) continue;
+ 
++    if (!state.stopping) {
++      try {
++        await continuePendingBackupOnce(engine, shutdownAbort.signal);
++      } catch (e) { logError('backup-pending', e); }
++    }
++
+     // --no-worker peer-liveness probe (v0.19.1). Runs every cycle, cheap
+     // (single SELECT). See the NO_WORKER_WARN_TICKS comment for caveats.
+     if (noWorker && useMinionsDispatch) await probeNoWorkerPeer(engine, state, baseInterval);
+--- a/test/backup-pending-continuation.test.ts
++++ b/test/backup-pending-continuation.test.ts
+@@ -0,0 +1,68 @@
++import { describe, expect, test } from 'bun:test';
++import { mkdtempSync, rmSync, writeFileSync } from 'fs';
++import { tmpdir } from 'os';
++import { join } from 'path';
++import {
++  __setBackupStatusPathForTests,
++  backupRemoteClaimsAllowContinuation,
++  pendingBackupContinuationEligible,
++  type BackupStatus,
++} from '../src/core/backup/status-file.ts';
++
++function status(overrides: Partial<BackupStatus> = {}): BackupStatus {
++  const now = '2026-10-14T00:00:00.000Z';
++  return {
++    schema_version: 'gbrain-backup-status-v2',
++    checked_at: now,
++    remote_check_at: now,
++    gbrain_version: '0.60.187.0',
++    interval_days: 30,
++    computed_by: 'cli',
++    overall: 'warn',
++    totals: { assets: 1, no_remote: 0, unpushed: 0, failing: 1, recoverable_repos: 0, pages_at_risk: 0 },
++    assets: [{
++      kind: 'source_repo',
++      id: 'workspace',
++      state: 'failing',
++      configured_remote: true,
++      verification: { state: 'budget_exhausted', checked_at: now },
++    }],
++    ...overrides,
++  };
++}
++
++describe('pending backup continuation', () => {
++  test('allows an unattempted budget_exhausted remote inside the hour', () => {
++    const now = Date.parse('2026-10-14T00:30:00.000Z');
++    expect(pendingBackupContinuationEligible(status(), now)).toBe(true);
++  });
++
++  test('refuses once remote evidence is older than one hour', () => {
++    const now = Date.parse('2026-10-14T02:00:00.000Z');
++    expect(pendingBackupContinuationEligible(status(), now)).toBe(false);
++  });
++
++  test('refuses a probe that already attempted', () => {
++    const cached = status();
++    cached.assets[0]!.verification!.attempted_at = cached.checked_at;
++    expect(pendingBackupContinuationEligible(cached, Date.parse('2026-10-14T00:30:00.000Z'))).toBe(false);
++  });
++
++  test('missing claims allow continuation and corrupt claims do not', () => {
++    const dir = mkdtempSync(join(tmpdir(), 'gbrain-backup-claims-'));
++    const path = join(dir, 'backup-status.json');
++    __setBackupStatusPathForTests(path);
++    try {
++      expect(backupRemoteClaimsAllowContinuation()).toBe(true);
++      writeFileSync(`${path}.remote-claims`, '{');
++      expect(backupRemoteClaimsAllowContinuation()).toBe(false);
++      writeFileSync(`${path}.remote-claims`, JSON.stringify({
++        generation: 'g', started_at: '2026-10-14T00:00:00.000Z', keys: ['a'],
++      }));
++      expect(backupRemoteClaimsAllowContinuation()).toBe(true);
++    } finally {
++      __setBackupStatusPathForTests(null);
++      rmSync(dir, { recursive: true, force: true });
++    }
++  });
++});
