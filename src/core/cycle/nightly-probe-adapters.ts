@@ -97,10 +97,14 @@ export async function runLongMemEvalForProbe(args: LongMemEvalProbeArgs): Promis
  * the run, which inside the daemon would also catch every other embed call.
  * `--reader-mode direct` (#6627): the judge grades DIRECTNESS, and the notes
  * reader's whole notes-plus-reasoning text becomes the hypothesis, so the
- * probe uses the original terse reader. The shared reader prompts stay as-is.
+ * probe requests a terse answer. Both reader modes use the versioned
+ * literal-label candidate prompts; this is not the historical prompt baseline.
  */
 export function buildLongMemEvalProbeCall(args: LongMemEvalProbeArgs): { argv: string[]; runOpts: RunOpts } {
-  const argv = [args.fixturePath, '--output', args.outputPath, '--no-embed-cache', '--reader-mode', 'direct'];
+  // The nightly QA rubric grades the whole answer for directness. Pin the
+  // direct answer style and an explicit 1024-token ceiling, retaining all
+  // brain-resolved routes. The prompt and cap need separate quality evaluation.
+  const argv = [args.fixturePath, '--output', args.outputPath, '--no-embed-cache', '--reader-mode', 'direct', '--reader-max-tokens', '1024'];
   const runOpts: RunOpts = { searchConfigSnapshot: args.searchConfigSnapshot, exitOnError: false };
   if (args.modelRoutes) {
     argv.push('--model', args.modelRoutes.reader.model);
