@@ -20,6 +20,7 @@ afterAll(async () => { await engine.disconnect(); });
 test('a brain with no refused caller writes is ok, and the check is wired to the explicit-only replay', async () => {
   const check = await lostCallerWritesCheck(engine);
   expect(check.status).toBe('ok');
+  expect(check.details).toMatchObject({ count_semantics: 'replayable_unacknowledged_intents', replayable_count: 0, preview_required: false });
   expect(check.details).toMatchObject({ count: 0, writes: [], compacted_unreplayable: 0, repair: 'failed-writes' });
   expect(categorizeCheck('lost_caller_writes')).toBe('ops');
   const spec = WAVE_CHECKS.find(spec => spec.id === 'lost_caller_writes');

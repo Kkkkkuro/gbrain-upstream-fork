@@ -230,7 +230,7 @@ export async function lostCallerWritesCheck(engine: BrainEngine, sourceIds?: str
     const { lost, compacted, not_replayable } = await lostCallerWrites(engine, sources);
     const count = lost.reduce((sum, row) => sum + row.count, 0);
     const kept = not_replayable.unpinned_target + not_replayable.revision_superseded;
-    const details = { count, writes: lost, ...(kept ? { not_replayable } : {}), compacted_unreplayable: compacted, repair: 'failed-writes', docs };
+    const details = { count, count_semantics: 'replayable_unacknowledged_intents', replayable_count: count, preview_required: count > 0, writes: lost, ...(kept ? { not_replayable } : {}), compacted_unreplayable: compacted, repair: 'failed-writes', docs };
     const compactedNote = compacted ? ` ${compacted} older refused receipt(s) were compacted (persistence.receipt_retention_days) and cannot be replayed.` : '';
     const keptNote = kept ? ` ${kept} refused caller write(s) cannot be replayed (${not_replayable.unpinned_target} remember whose subject was inferred, `
       + `${not_replayable.revision_superseded} put_page whose page changed after the revision the caller read); the caller has to write them again.` : '';
@@ -241,9 +241,9 @@ export async function lostCallerWritesCheck(engine: BrainEngine, sourceIds?: str
     const drift = lost.filter(row => row.reason === 'source_changed').reduce((sum, row) => sum + row.count, 0);
     const memory = lost.filter(row => row.operation === 'remember').reduce((sum, row) => sum + row.count, 0);
     return { name: 'lost_caller_writes', status: 'warn', details,
-      message: `${count} caller write(s) never landed (${memory} remember; ${drift} refused source_changed because the page's canonical file did not match its database copy `
+      message: `${count} retained caller intent(s) lack a committed acknowledgement (${memory} remember; ${drift} refused source_changed because the page's canonical file did not match its database copy `
         + `or was missing, ${count - drift} refused by the managed writer guard): ${[...bySource].map(([source, n]) => `${source}: ${n}`).join(', ')}. The callers saw an error and `
-        + `the fact or page edit was dropped. Preview the replay on the brain host: gbrain repair failed-writes --source ${first} — it lists which writes can be replayed and records `
+        + `the receipt remains unacknowledged; inspect the preview before deciding to replay. Preview on the brain host: gbrain repair failed-writes --source ${first} — it lists which writes can be replayed and records `
         + `an approval checkpoint for that set (no page content changes); then run the apply command it prints after the user agrees.${keptNote}${compactedNote}`,
       fix: agentFix(['gbrain', 'repair', 'failed-writes', '--source', first],
         'Preview: lists each lost write with its disposition (replay, already_written, duplicate, superseded, unpinned_target, file_database_drift), records an approval checkpoint for the replay set (no page content changes) and prints the apply command.', 'lost_caller_writes', { docs }) };
