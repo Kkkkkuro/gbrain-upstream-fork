@@ -77,6 +77,21 @@ export function haltReasonsWithUnknown(haltCount: number, recorded: Record<strin
   return reasons;
 }
 
+/** Exact pre-migration compatibility for this read path, never arbitrary error text. */
+export function isMissingExtractSchemaObject(err: unknown, kind: 'column' | 'table'): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const error = err as Record<string, unknown>;
+  const name = kind === 'column' ? 'halt_reasons' : 'extract_rollup_7d';
+  const nativeKey = kind === 'column' ? 'column_name' : 'table_name';
+  if (error[nativeKey] != null && typeof error[nativeKey] !== 'string') return false;
+  // Keep metadata authoritative even if a driver omits SQLSTATE. Numeric
+  // Error.column is a stack location, not a SQL identifier.
+  const identifiers = [error[nativeKey], typeof error[kind] === 'string' ? error[kind] : undefined]
+    .filter((value): value is string => typeof value === 'string');
+  if (identifiers.some(value => value !== name)) return false;
+  return isMissingSchemaObject(err, kind, name);
+}
+
 /**
  * The halt reasons recorded over the last 7 days, summed per kind. A brain
  * whose schema is behind v239 has no column: every halt then reads as
@@ -96,7 +111,7 @@ export async function readRecordedHaltReasons7d(engine: Pick<BrainEngine, 'execu
       recorded.set(row.kind, perKind);
     }
   } catch (err) {
-    if (!isMissingSchemaObject(err, 'column', 'halt_reasons')) throw err;
+    if (!isMissingExtractSchemaObject(err, 'column')) throw err;
   }
   return recorded;
 }

@@ -34,7 +34,7 @@ import { isOwnedContentSchemaMissing, ownedContentFreshness } from '../../../cor
 import { connectorAuthorities } from '../../../core/persistence/connector-authority.ts';
 import { parseSourceConfig } from '../../../core/sources-load.ts';
 import { checkError } from '../check-fix.ts';
-import { haltReasonsWithUnknown, readRecordedHaltReasons7d, topHaltReason } from '../../../core/extract/rollup-writer.ts';
+import { haltReasonsWithUnknown, isMissingExtractSchemaObject, readRecordedHaltReasons7d, topHaltReason } from '../../../core/extract/rollup-writer.ts';
 
 /** Local aliases; the shared warn-once memo lives in core so it can't fork per module. */
 const _resolveEnvNumber = resolveEnvNumber;
@@ -1190,7 +1190,7 @@ export async function computeExtractHealthCheck(
     // bootstrap-coverage / migration framework brings the schema forward
     // and the next run resolves naturally. Stay quiet.
     const msg = (err as Error).message || String(err);
-    if (isMissingSchemaObject(err, 'table', 'extract_rollup_7d')) {
+    if (isMissingExtractSchemaObject(err, 'table')) {
       return {
         name,
         status: 'ok',
