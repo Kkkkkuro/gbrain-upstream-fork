@@ -19,6 +19,7 @@ import type { BrainEngine } from '../../../core/engine.ts';
 import { loadConfig, type GBrainConfig } from '../../../core/config.ts';
 import { grantFromRow, grantFromTokenRow } from '../../../core/grants/model.ts';
 import { readClientCatalogProvenance } from '../../../core/grants/service.ts';
+import { hasScope } from '../../../core/scope.ts';
 import { ALL_OPERATIONS_CHOICE, grantAge, grantBlockers, grantOperationGaps, grantRescopeArgvs, type GrantGaps, type RescopeTarget } from '../../../core/harness/capabilities.ts';
 import { clampSurface, isMcpSurface, minSurface, resolveDefaultClientSurface, resolveSurface, surfaceWiderThan, type McpSurface } from '../../../mcp/surface.ts';
 import { disabledOpsForPublishGates } from '../../../mcp/publish-gates.ts';
@@ -40,10 +41,13 @@ interface GrantFinding {
   preview_argv: string[];
   argv: string[];
   all_operations_argv: string[];
+  execution_prerequisites?: Array<{
+    operation: 'confirm_memory'; applies_to: 'trust_promotion'; required_scope: 'memory_confirm'; scope_granted: boolean;
+  }>;
 }
 
 function finding(kind: GrantFinding['kind'], id: string, name: string, profile: string | null, gaps: GrantGaps, target: RescopeTarget,
-  snapshot: readonly string[] | null, age: ReturnType<typeof grantAge>, surfaces: { client: McpSurface | null; clientSetBy: string | null; server: McpSurface | null }): GrantFinding {
+  snapshot: readonly string[] | null, age: ReturnType<typeof grantAge>, surfaces: { client: McpSurface | null; clientSetBy: string | null; server: McpSurface | null }, scopes: string[]): GrantFinding {
   const bulk = gaps.snapshotExcluded.includes(BULK_WRITE);
   const operations = !bulk ? null : kind === 'legacy_token' ? BULK_WRITE : [...new Set([...(snapshot ?? []), BULK_WRITE])].sort().join(',');
   const argvs = grantRescopeArgvs(target, gaps, operations);
@@ -52,7 +56,23 @@ function finding(kind: GrantFinding['kind'], id: string, name: string, profile: 
     kind, id, name, profile, blockers,
     excluded_operations: { operation_snapshot: gaps.snapshotExcluded, client_pin: gaps.pinExcluded, server_ceiling: gaps.serverExcluded },
     grant_age: age, preview_argv: argvs.preview, argv: argvs.apply, all_operations_argv: argvs.all_operations,
+    // Admission to the operation is not permission to promote trust. Keep the
+    // catalog/snapshot counts intact: dry-run and unchanged outcomes differ
+    // from the promotion guarded by requireOwnerConfirmation.
+    ...(gaps.snapshotExcluded.includes('confirm_memory') ? { execution_prerequisites: [{
+      operation: 'confirm_memory' as const, applies_to: 'trust_promotion' as const,
+      required_scope: 'memory_confirm' as const, scope_granted: hasScope(scopes, 'memory_confirm'),
+    }] } : {}),
   };
+}
+
+function prerequisiteNote(f: GrantFinding): string {
+  const prerequisite = f.execution_prerequisites?.[0];
+  if (!prerequisite) return '';
+  return ' confirm_memory: actual trust promotion separately requires memory_confirm; '
+    + (prerequisite.scope_granted ? 'the memory_confirm scope is present on this grant.'
+      : 'that scope is absent (admin does not imply it), so snapshot-only rescope cannot enable trust promotion.')
+    + ' Its dry-run and already-confirmed no-op do not promote trust. This diagnostic does not recommend granting owner confirmation authority.';
 }
 
 /** A command for prose: a spelled-out operation list is summarized; details carry the exact argv. */
@@ -66,7 +86,7 @@ function describeFinding(f: GrantFinding): string {
     : b.blocker === 'client_pin' ? `its stored ${b.surface} surface excludes ${b.excluded_count}`
     : `the configured ${b.surface} server surface excludes ${b.excluded_count}`);
   const age = 'statement' in f.grant_age ? ` ${f.grant_age.statement}` : '';
-  return `${label}: ${parts.join(', ')}.${age} Preview: ${shownCommand(f.preview_argv)}`;
+  return `${label}: ${parts.join(', ')}.${age}${prerequisiteNote(f)} Preview: ${shownCommand(f.preview_argv)}`;
 }
 
 export async function checkGrantNewOps(engine: BrainEngine, opts: { cfg?: GBrainConfig | null } = {}): Promise<Check> {
@@ -92,7 +112,7 @@ export async function checkGrantNewOps(engine: BrainEngine, opts: { cfg?: GBrain
         ? await readClientCatalogProvenance(engine, grant.clientId, grant.allowedOperations) : null;
       findings.push(finding('oauth_client', grant.clientId, grant.clientName, grant.profile, gaps, { kind: 'oauth_client', id: grant.clientId },
         grant.allowedOperations, grantAge(gaps.snapshotExcluded, grant.allowedOperations !== null, provenance),
-        { client, clientSetBy: grant.surfaceSetBy, server }));
+        { client, clientSetBy: grant.surfaceSetBy, server }, grant.scopes));
     }
 
     const tokens = await engine.executeRaw<Record<string, unknown>>('SELECT * FROM access_tokens WHERE revoked_at IS NULL ORDER BY created_at, id');
@@ -108,7 +128,7 @@ export async function checkGrantNewOps(engine: BrainEngine, opts: { cfg?: GBrain
       const name = String(row.name);
       const flag: ['--token' | '--id', string] = nameCounts.get(name) === 1 ? ['--token', name] : ['--id', grant.principal.id];
       findings.push(finding('legacy_token', grant.principal.id, name, null, gaps, { kind: 'legacy_token', flag },
-        grant.allowedOperations, grantAge(gaps.snapshotExcluded, true, null), { client: null, clientSetBy: null, server: ceiling }));
+        grant.allowedOperations, grantAge(gaps.snapshotExcluded, true, null), { client: null, clientSetBy: null, server: ceiling }, grant.scopes));
     }
 
     const ceilingNote = surfaceWiderThan('full', ceiling)
@@ -125,7 +145,7 @@ export async function checkGrantNewOps(engine: BrainEngine, opts: { cfg?: GBrain
       why: 'An operation snapshot or a stored client surface keeps this grant from operations its scopes allow; changing it widens what that credential can do.',
       user_message: `${findings.length} connection grant(s) cannot call operations their scopes allow (first: ${first.name}). `
         + `For ${first.name}: preview the change with ${shownCommand(first.preview_argv)}, then apply it; or leave it as it is; `
-        + `or remove its snapshot with ${first.all_operations_argv.join(' ')} (${ALL_OPERATIONS_CHOICE}). Which do you want?`,
+        + `or remove its snapshot with ${first.all_operations_argv.join(' ')} (${ALL_OPERATIONS_CHOICE}).${prerequisiteNote(first)} Which do you want?`,
       ...(placeholder ? { inputs: [{ name: 'OPERATIONS', how: `The operations the user approves for ${first.name}, comma-separated (clients: the whole new snapshot, i.e. the current one plus the approved additions; details.grants[0].excluded_operations lists the candidates).` }] } : {}),
     };
     return {
