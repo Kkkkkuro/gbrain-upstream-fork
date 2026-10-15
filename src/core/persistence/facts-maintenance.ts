@@ -80,6 +80,8 @@ export interface ManagedFactsSession {
   fileRefusalRetry?: boolean;
   /** #6506: the batch is keyed by its input alone (no request id), so a stored withdrawal refusal would replay on every run. */
   inputKeyed?: boolean;
+  /** Automatic extraction backed by a committed page write, without an explicit extract_facts request id. */
+  pageWriteRevisionRetry?: boolean;
   /** #6091: set when the facts come from an ambient capture lane. */
   captureSource?: string;
   derivation?: DerivationDeclaration;
@@ -274,6 +276,7 @@ export async function prepareManagedFactsSession(ctx: FactsBackstopCtx,
     completionRequestId: ctx.requestId ? requireUuid(ctx.requestId) : managedFactRequestId(batchKey, '__managed_facts_complete__'),
     fileRefusalRetry: ctx.reAdmitFileRefusals === true && seed === inputDigest,
     inputKeyed: seed === inputDigest,
+    pageWriteRevisionRetry: !!ctx.persistenceRequestId && !ctx.requestId,
     ...(captureGateLaneForSource(ctx.source) ? { captureSource: ctx.source } : {}),
     ...(derivation ? { derivation: declareDerivation(derivation.trust, derivation.inputs) } : {}) };
   const prior = await getWriteRequest(engine, authority.principal, session.completionRequestId);
@@ -309,7 +312,8 @@ export async function resumeManagedFacts(engine: BrainEngine, session: ManagedFa
   const stored = await storedBatch(engine, session);
   if (!stored) return null;
   const rows = session.fileRefusalRetry ? await followFileRefusals(engine, session, stored) : stored;
-  return collectManagedFacts(engine, session, session.inputKeyed ? await followWithdrawalRefusals(engine, session, rows) : rows);
+  const revisions = session.pageWriteRevisionRetry ? await followEntityRevisionRefusals(engine, session, rows) : rows;
+  return collectManagedFacts(engine, session, session.inputKeyed ? await followWithdrawalRefusals(engine, session, revisions) : revisions);
 }
 
 /** Every request journaled under the session's batch key, once its completion receipt validates; null when nothing was accepted. */
@@ -355,6 +359,44 @@ async function followFileRefusals(engine: BrainEngine, session: ManagedFactsSess
  */
 async function followWithdrawalRefusals(engine: BrainEngine, session: ManagedFactsSession, stored: WriteRequest[]): Promise<WriteRequest[]> {
   return followRefusals(engine, session, stored, 'withdrawal-retry', withdrawalRefusal, readmitWithdrawnFacts);
+}
+
+/**
+ * A page-backed automatic job retains its extracted facts after an entity CAS refusal.
+ * Retrying that job must not replay the same terminal entity receipt forever. Re-admit
+ * only this admission-time CAS race, under bounded, deterministic follow-up identities;
+ * explicit extract_facts request ids keep their immutable receipt replay semantics.
+ */
+async function followEntityRevisionRefusals(engine: BrainEngine, session: ManagedFactsSession, stored: WriteRequest[]): Promise<WriteRequest[]> {
+  return followRefusals(engine, session, stored, 'entity-revision-retry', row => row.error_code === 'revision_conflict'
+    && row.error_message === 'The fact entity changed after extraction admission.'
+    && row.intent?.withdrawn === 'skip' && row.intent?.supersede !== true
+    && row.intent?.originalRequestId === session.originalRequestId && session.originalRequestId !== null,
+  readmitEntityRevisionFacts);
+}
+
+/** Keep the origin and entity identities fixed; only rebase the append on the live entity revision. */
+async function readmitEntityRevisionFacts(engine: BrainEngine, followUp: ManagedFactsSession, refused: WriteRequest[]): Promise<WriteRequest[] | null> {
+  const sourceId = followUp.authority.sourceId;
+  const privateOnly = await resolveDefaultVisibility(engine) === 'private';
+  const entities: ManagedFactsEntityInput[] = [];
+  for (const row of refused) {
+    await authorizeStoredRequest(engine, row);
+    await authorizeWrite(engine, followUp.authority, 'extract_facts', row.slug);
+    await authorizePageVisibility(engine, followUp.authority, row.slug);
+    const kept = row.intent as ManagedFactIntent;
+    // Retained candidates keep their admitted visibility; a current policy
+    // refusal does not rewrite the frozen candidates.
+    if (privateOnly && kept.facts!.some(fact => fact.visibility !== 'private')) return null;
+    if (!kept.origin || kept.origin.slug === row.slug) return null;
+    const origin = await engine.readPageSnapshot(kept.origin.slug, { sourceId });
+    const page = await engine.readPageSnapshot(row.slug, { sourceId });
+    if (!origin || origin.page.id !== kept.origin.pageId || origin.revision !== kept.origin.revision
+      || !page || page.page.id !== row.page_id || !kept.expected_revision) return null;
+    entities.push({ slug: row.slug, pageId: page.page.id, intent: { ...kept, batchKey: followUp.batchKey,
+      expected_revision: page.revision } });
+  }
+  return admitManagedFactsBatch(engine, followUp, entities, entities.some(entity => entity.intent.facts!.some(fact => fact.embedding != null)));
 }
 
 function withdrawalRefusal(row: WriteRequest): boolean {
