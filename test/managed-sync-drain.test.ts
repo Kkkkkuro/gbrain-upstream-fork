@@ -10,6 +10,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { readManagedSyncBacklog, runDrain } from '../src/core/persistence/sync-drain.ts';
+import { checkManagedSyncBacklog } from '../src/commands/doctor/checks/managed-sync-backlog.ts';
 import { performSync } from '../src/commands/sync/perform.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -41,6 +42,29 @@ afterAll(async () => {
   });
   await closePostgres?.();
   rmSync(home, { recursive: true, force: true });
+});
+
+// Protect the stored cursor -> Doctor boundary, including SQL's done filter.
+// A missing discovery fallback warns immediately on a newly stored cursor;
+// using updated_at instead hides a genuinely old cursor after bookkeeping.
+// Existing drain tests cover resumption/ETA, not pre-first-progress age.
+test('Doctor ages a stored unadvanced cursor from discovery rather than bookkeeping writes', async () => {
+  for (const engine of engines) {
+    const key = randomUUID(), sourceId = `backlog-${randomUUID()}`;
+    const header = { sourceId, index: 0, total: 0, discoveredAt: new Date(Date.now() - 1_000).toISOString() };
+    try {
+      await engine.executeRaw("INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('managed-sync',$1,$2::text::jsonb)", [key, JSON.stringify([header])]);
+      expect((await checkManagedSyncBacklog(engine, [sourceId]))?.status).toBe('ok');
+      expect((await readManagedSyncBacklog(engine, [sourceId]))[0]).toMatchObject({ last_progress_at: null, discovered_at: header.discoveredAt });
+      header.discoveredAt = new Date(Date.now() - 2 * 60 * 60_000).toISOString();
+      await engine.executeRaw("UPDATE op_checkpoints SET completed_keys=$2::text::jsonb,updated_at=now() WHERE op='managed-sync' AND fingerprint=$1", [key, JSON.stringify([header])]);
+      expect((await checkManagedSyncBacklog(engine, [sourceId]))?.status).toBe('warn');
+      await engine.executeRaw("UPDATE op_checkpoints SET completed_keys=jsonb_set(completed_keys,'{0,done}','true'::jsonb) WHERE op='managed-sync' AND fingerprint=$1", [key]);
+      expect(await checkManagedSyncBacklog(engine, [sourceId])).toBeNull();
+    } finally {
+      await engine.executeRaw("DELETE FROM op_checkpoints WHERE op='managed-sync' AND fingerprint=$1", [key]);
+    }
+  }
 });
 
 test('a drain re-enters sliced passes over one cursor until it is synced and records its drain window', async () => withEnv({ GBRAIN_HOME: home }, async () => {

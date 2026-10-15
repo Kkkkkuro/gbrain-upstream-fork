@@ -9,7 +9,12 @@ export async function checkManagedSyncBacklog(engine: BrainEngine | null, source
   if (!engine) return null;
   const backlog = await readManagedSyncBacklog(engine, sourceIds);
   if (!backlog.length) return null;
-  const idle = backlog.filter(b => !b.last_progress_at || Date.now() - Date.parse(b.last_progress_at) > IDLE_MS);
+  const now = Date.now();
+  const idle = backlog.filter(b => {
+    // Discovery is frozen with the run; unrelated cursor writes must not reset its idle age.
+    const since = Date.parse(b.last_progress_at ?? b.discovered_at ?? '');
+    return !Number.isFinite(since) || since > now || now - since > IDLE_MS;
+  });
   const lines = backlog.map(formatManagedSyncBacklog).join('; ');
   return { name: 'managed_sync_backlog', status: idle.length ? 'warn' : 'ok',
     message: idle.length

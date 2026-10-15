@@ -187,6 +187,45 @@ describe('managed sync backlog', () => {
       progress: { startedAt: now - 60_000, startIndex: 440, lastAt: now, lastIndex: 500 } }]));
     expect(b!.rate_pages_per_min).toBe(60);
   });
+
+  // Doctor must age an unadvanced cursor from its frozen discovery, not treat
+  // no first progress as an hour-long stall. Reverting the reader/check fix
+  // makes the fresh cases fail; existing ETA tests do not call Doctor. Uses
+  // the existing executeRaw fixture, with no new production seam.
+  test('fresh cursors awaiting their first advance do not warn, including an empty manifest', async () => {
+    const { checkManagedSyncBacklog } = await import('../src/commands/doctor/checks/managed-sync-backlog.ts');
+    const { readManagedSyncBacklog } = await import('../src/core/persistence/sync-drain.ts');
+    for (const total of [0, 50]) {
+      const engine = engineWith([{ sourceId: 'notes', index: 0, total, discoveredAt: new Date(Date.now() - 1_000).toISOString() }]);
+      expect((await checkManagedSyncBacklog(engine))?.status).toBe('ok');
+      // Discovery establishes age, never a fabricated page advancement/rate.
+      expect((await readManagedSyncBacklog(engine))[0]).toMatchObject({ last_progress_at: null, rate_pages_per_min: null, eta_seconds: null });
+    }
+  });
+
+  test('the one-hour stall boundary still applies before the first advance', async () => {
+    const { checkManagedSyncBacklog } = await import('../src/commands/doctor/checks/managed-sync-backlog.ts');
+    for (const total of [0, 50]) {
+      for (const [minutes, expected] of [[59, 'ok'], [61, 'warn']] as const) {
+        const engine = engineWith([{ sourceId: 'notes', index: 0, total, discoveredAt: new Date(Date.now() - minutes * 60_000).toISOString() }]);
+        expect((await checkManagedSyncBacklog(engine))?.status).toBe(expected);
+      }
+    }
+  });
+
+  test('actual progress takes precedence over discovery and absent or invalid clocks fail safe', async () => {
+    const { checkManagedSyncBacklog } = await import('../src/commands/doctor/checks/managed-sync-backlog.ts');
+    const now = Date.now(), old = now - 2 * 60 * 60_000;
+    for (const [discoveredAt, lastAt, expected] of [[old, now, 'ok'], [now, old, 'warn']] as const) {
+      const engine = engineWith([{ sourceId: 'notes', index: 1, total: 50, discoveredAt: new Date(discoveredAt).toISOString(),
+        progress: { startedAt: old, startIndex: 0, lastAt, lastIndex: 1 } }]);
+      expect((await checkManagedSyncBacklog(engine))?.status).toBe(expected);
+    }
+    for (const discoveredAt of [undefined, 'invalid', new Date(now + 60_000).toISOString()]) {
+      expect((await checkManagedSyncBacklog(engineWith([{ sourceId: 'notes', index: 0, total: 0, discoveredAt }])))?.status).toBe('warn');
+    }
+    expect(await checkManagedSyncBacklog(engineWith([]))).toBeNull();
+  });
 });
 
 describe('classified write waits', () => {
