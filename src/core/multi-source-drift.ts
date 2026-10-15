@@ -127,11 +127,11 @@ function walkMarkdownAndMdxFiles(
     }
     for (const entry of entries) {
       if (truncated) return;
-      const relPath = relative(root, join(d, entry)).split(sep).join('/');
+      const full = join(d, entry);
+      const relPath = relative(root, full).split(sep).join('/');
       // Only dot pruning is waivable; raw sidecars and generated/vendor trees
       // stay excluded even when an include_hidden glob permits the parent.
       if (isPathPruned(relPath, includeHidden.length ? ['**'] : undefined)) continue;
-      const full = join(d, entry);
       let isDir = false;
       try {
         const stat = lstatSync(full);
