@@ -7,7 +7,7 @@
  * patches process-global stdout/exit.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -45,7 +45,9 @@ process.exit(0);`);
       const { ts, ...event } = JSON.parse(raw.split('\n').pop()!);
       expect(typeof ts).toBe('string');
       const { VERSION } = await import('../src/version.ts');
-      expect(event).toEqual({ transport: 'cli', command: 'doctor', code: 'json_document_missing', outcome: 'committed', version: VERSION, guard: 'document', exit_code: 0 });
+      const { diagnostics, ...flat } = event;
+      expect(flat).toEqual({ transport: 'cli', command: 'doctor', code: 'json_document_missing', outcome: 'committed', version: VERSION, guard: 'document', exit_code: 0 });
+      expect(diagnostics).toMatchObject({ schema_version: 1, version: VERSION, guard_mode: 'document', exit_code: 0 });
       expect(raw).not.toContain('private-arg-value');
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -272,4 +274,120 @@ describe('D2 command migrations: embed --facts on a brain with an embedding mode
       rmSync(home, { recursive: true, force: true });
     }
   }, 150_000);
+});
+
+// Exercise the real guard → exit hook → bounded event writer without CLI/DB startup.
+describe('missing-document diagnostics', () => {
+  async function probe(body: string, argv = ['doctor', '--json'], mode?: 'ndjson', failContext = false, legacyHook = false) {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-json-diagnostic-'));
+    const script = join(dir, 'run.ts');
+    let guard = join(import.meta.dir, '..', 'src', 'cli', 'json-guard.ts');
+    if (legacyHook) {
+      const stub = join(dir, 'old-hook.ts');
+      writeFileSync(stub, `export const jsonRequested = () => true; export function setJsonDocumentMissingHook(hook) { globalThis.oldJsonMissingHook = hook; }`);
+      const copy = readFileSync(guard, 'utf8')
+        .replace("'../core/cli-force-exit.ts'", JSON.stringify(stub))
+        .replace("'../version.ts'", JSON.stringify(join(import.meta.dir, '..', 'src', 'version.ts')))
+        .replace("'../core/agent-contract-log.ts'", JSON.stringify(join(import.meta.dir, '..', 'src', 'core', 'agent-contract-log.ts')))
+        .replace("'./command-table.ts'", JSON.stringify(join(import.meta.dir, '..', 'src', 'cli', 'command-table.ts')));
+      guard = join(dir, 'copied-real-guard.ts');
+      writeFileSync(guard, copy);
+    }
+    writeFileSync(script, `import * as g from ${JSON.stringify(HELPER)};
+import { agentJsonGuardMode } from ${JSON.stringify(guard)};
+const args = ${JSON.stringify(argv)};
+if (${failContext}) {
+  let iterations = 0;
+  Object.defineProperty(args, Symbol.iterator, { value() {
+    if (++iterations > 1) throw new Error('PRIVATE_CONTEXT_ERROR');
+    return Array.prototype[Symbol.iterator].call(this);
+  } });
+}
+const mode = agentJsonGuardMode(args);
+g.installStdoutPipeDelivery(${mode ? JSON.stringify({ json: mode }) : 'mode'});
+${body}\n`);
+    try {
+      const proc = Bun.spawn([process.execPath, '--no-env-file', script], {
+        cwd: dir, env: { HOME: dir, GBRAIN_HOME: dir, PATH: process.env.PATH ?? '' },
+        stdout: 'pipe', stderr: 'pipe',
+      });
+      const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+      const file = Bun.file(join(dir, '.gbrain', 'agent-contract', 'events.jsonl'));
+      const raw = await file.exists() ? await file.text() : '';
+      return { out, err, code, raw, events: raw.trim() ? raw.trim().split('\n').map(line => JSON.parse(line)) : [] };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  test('records bounded shape and exact UTF8 / Uint8Array attempted bytes, never argument values', async () => {
+    const r = await probe(`console.log('秘密');
+process.stdout.write(new Uint8Array([65, 66, 67]));
+process.stdout.write('ff', 'hex');
+process.exit(0);`, ['doctor', '--json', '--fast', '--only=SECRET_CHECK', '--unknown-secret=SECRET_VALUE', '--token', 'SECRET_TOKEN', '--json', '--', '--remediate']);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe('');
+    expect(r.events).toHaveLength(1);
+    const d = r.events[0].diagnostics;
+    expect(d).toMatchObject({ schema_version: 1, guard_mode: 'document', exit_code: 0,
+      final_document_written: false, redirected_stdout_bytes: 11, flag_names: ['--json', '--fast', '--only'] });
+    const { VERSION } = await import('../src/version.ts');
+    expect(d.version).toBe(VERSION);
+    expect(d.invocation_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(Object.keys(d).sort()).toEqual(['schema_version', 'version', 'invocation_id', 'flag_names', 'guard_mode', 'exit_code', 'final_document_written', 'redirected_stdout_bytes'].sort());
+    for (const secret of ['秘密', 'SECRET_CHECK', 'SECRET_VALUE', 'SECRET_TOKEN', '--unknown-secret', '--token', '--remediate']) expect(r.raw).not.toContain(secret);
+  });
+
+  test('separate invocations have distinct identifiers and zero output counts', async () => {
+    const a = await probe('process.exit(0);');
+    const b = await probe('process.exit(0);');
+    expect(a.events[0].diagnostics.redirected_stdout_bytes).toBe(0);
+    expect(a.events[0].diagnostics.invocation_id).not.toBe(b.events[0].diagnostics.invocation_id);
+  });
+
+  test('normal JSON emits no missing-document event', async () => {
+    const r = await probe(`await g.writeStdoutFinal('{"ok":true}\\n'); process.exit(0);`);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.out)).toEqual({ ok: true });
+    expect(r.events).toEqual([]);
+  });
+
+  test('nonzero fallback retains its exit and emits no missing-document event', async () => {
+    const r = await probe('process.exit(2);');
+    expect(r.code).toBe(2);
+    expect(JSON.parse(r.out)).toMatchObject({ exit_code: 2, error: 'command_failed' });
+    expect(r.events).toEqual([]);
+  });
+
+  test('empty NDJSON emits no missing-document event', async () => {
+    const r = await probe('process.exit(0);', ['doctor', '--json'], 'ndjson');
+    expect(r.code).toBe(0);
+    expect(r.out).toBe('');
+    expect(r.events).toEqual([]);
+  });
+
+  test('context collection failure preserves the original event without private error text', async () => {
+    const r = await probe('process.exit(0);', ['doctor', '--json'], undefined, true);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe('');
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0]).toMatchObject({ command: 'doctor', code: 'json_document_missing', outcome: 'committed' });
+    expect(r.events[0].diagnostics).toBeUndefined();
+    expect(r.raw + r.err).not.toContain('PRIVATE_CONTEXT_ERROR');
+  });
+
+  test('legacy no-argument hook preserves an event without incomplete schema metadata', async () => {
+    const r = await probe('globalThis.oldJsonMissingHook(); process.exit(0);', ['doctor', '--json'], undefined, false, true);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe('');
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0]).toMatchObject({ command: 'doctor', code: 'json_document_missing', outcome: 'committed' });
+    expect(r.events[0].diagnostics).toBeUndefined();
+  });
+
+  test('a failing diagnostics hook cannot change exit or output', async () => {
+    const r = await probe(`g.setJsonDocumentMissingHook(() => { throw new Error('PRIVATE_HOOK_ERROR'); }); process.exit(0);`);
+    expect(r.code).toBe(0);
+    expect(r.out).toBe('');
+    expect(r.err).not.toContain('PRIVATE_HOOK_ERROR');
+    expect(r.events).toEqual([]);
+  });
 });

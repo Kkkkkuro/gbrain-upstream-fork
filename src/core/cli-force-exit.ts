@@ -760,6 +760,11 @@ export function installStdoutPipeDelivery(opts: { json?: 'document' | 'ndjson' }
   stdoutInterposed = true;
   jsonGuardMode = opts.json ?? null;
   const toStderr = (data: string | Uint8Array, encoding?: BufferEncoding): Promise<void> => {
+    // Diagnostic metadata only: count attempted bytes, never retain payloads.
+    try {
+      const bytes = typeof data === 'string' ? Buffer.byteLength(data, encoding ?? 'utf8') : data.byteLength;
+      redirectedStdoutBytes = Math.min(Number.MAX_SAFE_INTEGER, redirectedStdoutBytes + bytes);
+    } catch { /* diagnostics must not change the writer's behavior */ }
     try { process.stderr.write(typeof data === 'string' ? Buffer.from(data, encoding ?? 'utf8') : data); } catch { /* best effort */ }
     return Promise.resolve();
   };
@@ -819,6 +824,7 @@ export function installStdoutPipeDelivery(opts: { json?: 'document' | 'ndjson' }
 
 let jsonGuardMode: 'document' | 'ndjson' | null = null;
 let jsonDocumentWritten = false;
+let redirectedStdoutBytes = 0;
 let lastRenderedErrorCode: string | undefined;
 
 /** renderCliError's callers record the code they rendered so the fallback document can carry it. */
@@ -848,11 +854,22 @@ function writeJsonFallbackIfMissing(exitCode: number): void {
   void chainStdoutWrite(text).catch(() => { /* fd 1 gone */ });
 }
 
-let jsonMissingHook: (() => void) | null = null;
+/** Facts observed at the missing-document seam; no output content or caller identity. */
+export interface JsonDocumentMissingObservation {
+  guard_mode: 'document';
+  exit_code: 0;
+  final_document_written: false;
+  /** Bytes attempted through stdout paths redirected to stderr, not delivery confirmation. */
+  redirected_stdout_bytes: number;
+}
+let jsonMissingHook: ((observation: JsonDocumentMissingObservation) => void) | null = null;
 /** E11 seam, set by the CLI so this module stays free of config imports. */
-export function setJsonDocumentMissingHook(hook: () => void): void { jsonMissingHook = hook; }
+export function setJsonDocumentMissingHook(hook: (observation: JsonDocumentMissingObservation) => void): void { jsonMissingHook = hook; }
 function recordJsonDocumentMissing(): void {
-  try { jsonMissingHook?.(); } catch { /* fail-open */ }
+  try {
+    jsonMissingHook?.({ guard_mode: 'document', exit_code: 0, final_document_written: false,
+      redirected_stdout_bytes: redirectedStdoutBytes });
+  } catch { /* fail-open */ }
 }
 
 /**

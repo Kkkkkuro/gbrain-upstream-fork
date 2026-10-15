@@ -14,6 +14,7 @@ import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from
 import { dirname } from 'node:path';
 import { gbrainPath } from './config.ts';
 import type { Effect, Transport } from './agent-output.ts';
+import type { JsonDocumentMissingObservation } from './cli-force-exit.ts';
 
 const MAX_BYTES = 1024 * 1024;
 
@@ -33,6 +34,15 @@ export interface AgentContractEvent {
   guard?: 'document' | 'ndjson';
   /** #6629: the process exit code the event was recorded at. */
   exit_code?: number;
+  /** Missing-document metadata only; never raw argv, values, output, environment or paths. */
+  diagnostics?: JsonDocumentMissingObservation & {
+    schema_version: 1;
+    version: string;
+    /** Random invocation identifier, not a caller identity or proof of provenance. */
+    invocation_id: string;
+    /** Fixed allowlist of flag names observed in argv; not a parsed execution route. */
+    flag_names: string[];
+  };
 }
 
 export function agentContractLogPath(): string {
