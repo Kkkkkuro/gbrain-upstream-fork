@@ -306,7 +306,7 @@ INNER_CMD="${INNER_CMD%%__RUN_PHASES__*}${RUN_PHASES_CMD}${INNER_CMD#*__RUN_PHAS
 # shared common gitdir and bind-mount them at the same absolute paths.
 EXTRA_MOUNTS=()
 if [ -f .git ]; then
-  WORKTREE_GITDIR=$(awk '{print $2}' .git)
+  WORKTREE_GITDIR=$(sed -n 's/^gitdir: //p' .git)
   if [ -d "$WORKTREE_GITDIR" ]; then
     COMMONDIR_FILE="$WORKTREE_GITDIR/commondir"
     if [ -f "$COMMONDIR_FILE" ]; then
