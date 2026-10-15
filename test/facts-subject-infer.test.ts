@@ -146,6 +146,53 @@ describe('inferFactSubject precision fixture', () => {
 });
 
 describe('inferFactSubject reasons', () => {
+  test('never resolves a dotted Unicode slug as a different prefix entity', async () => {
+    await page('companies/北海', 'Prefix Example', 'company');
+    try {
+      expect((await inferFactSubject(engine, 'default', { fact: 'companies/北海.io 完成季度计划。', mode: 'write' })).slug).toBeNull();
+      // importFromContent's path input strips a file extension. Use the
+      // storage boundary so this fixture actually contains the complete slug.
+      await engine.putPage('companies/北海.io', { title: 'Dotted Example', type: 'company', compiled_truth: '# Dotted Example\n' });
+      expect(await engine.getPage('companies/北海.io')).not.toBeNull();
+      expect(await inferFactSubject(engine, 'default', { fact: 'companies/北海.io 完成季度计划。', mode: 'write' }))
+        .toEqual({ slug: 'companies/北海.io', via: 'mention' });
+    } finally {
+      await engine.executeRaw("DELETE FROM pages WHERE source_id='default' AND slug IN ('companies/北海','companies/北海.io')");
+    }
+  });
+  // Whole explicit paths must retain their identity. ASCII-only extraction
+  // linked an unregistered Unicode path to a different existing page; the
+  // existing ASCII precision fixture had no mixed-script paths. No new seam.
+  test('never links an ASCII prefix of a Unicode explicit slug', async () => {
+    for (const fact of [
+      'people/alice-example中文 owns the checklist',
+      'people/alice-exampleé owns the checklist',
+      '中文people/alice-example owns the checklist',
+    ]) {
+      const r = await inferFactSubject(engine, 'default', { fact, mode: 'write' });
+      expect(r.slug).toBeNull();
+    }
+  });
+  test('resolves a complete Unicode explicit slug in its source', async () => {
+    await page('people/alice-example中文', 'Unicode Example', 'person');
+    try {
+      expect(await inferFactSubject(engine, 'default', { fact: 'people/alice-example中文 owns the checklist', mode: 'write' }))
+        .toEqual({ slug: 'people/alice-example中文', via: 'mention' });
+    } finally {
+      await engine.executeRaw("DELETE FROM pages WHERE source_id = 'default' AND slug = 'people/alice-example中文'");
+    }
+  });
+
+  test('literal filename normalization keeps exact stored identity and refuses other suffixes', async () => {
+    await engine.putPage('people/charlie-example.md', { title: 'File Literal Example', type: 'person', compiled_truth: '# File Literal Example\n' });
+    try {
+      expect(await inferFactSubject(engine, 'default', { fact: 'people/charlie-example.md owns the launch', mode: 'write' }))
+        .toEqual({ slug: 'people/charlie-example.md', via: 'mention' });
+      expect((await inferFactSubject(engine, 'default', { fact: 'people/charlie-example.txt owns the launch', mode: 'write' })).slug).toBeNull();
+      expect((await inferFactSubject(engine, 'default', { fact: 'people/charlie-example.md未知 owns the launch', mode: 'write' })).slug).toBeNull();
+    } finally { await engine.executeRaw("DELETE FROM pages WHERE source_id='default' AND slug='people/charlie-example.md'"); }
+  });
+
   test('veto by a name with no page reports ambiguous', async () => {
     expect(await inferFactSubject(engine, 'default', { fact: "Northstar Example copied Acme Example's pricing", mode: 'write' }))
       .toMatchObject({ slug: null, reason: 'ambiguous' });

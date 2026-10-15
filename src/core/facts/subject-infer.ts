@@ -25,6 +25,7 @@ import type { BrainEngine } from '../engine.ts';
 import { extractCandidates, isCommonCapitalizedWord } from '../context/entity-salience.ts';
 import { isFactEntityPage, resolveStrictEntityReference, type StrictResolution } from '../entities/resolve.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+import { SLUG_WORD_CHARS } from '../cjk.ts';
 
 export type InferredVia = 'page' | 'mention';
 export type InferMissReason = 'ambiguous' | 'unverified_match' | 'no_mention' | 'no_page';
@@ -107,23 +108,19 @@ const SENTENCE_OPENERS = new Set([
   'favorite', 'favourite', 'birthday', 'anniversary', 'allergic', 'vegetarian', 'vegan', 'lives', 'lived', 'works', 'worked',
 ]);
 
-/**
- * Slugs written verbatim in the fact text ("people/alice-example owns the checklist", "people/例子").
- * Segments use the lowercase page-slug letters the strict resolver's exact arm accepts (combining
- * marks are not among them, so a marked literal is never a literal). A literal glued to further
- * letters or marks on either side is not a literal, so "people/alice-example未知" never resolves to
- * its ASCII prefix.
- */
-const SLUG_SEG = '[\\p{Ll}\\p{Lm}\\p{Lo}\\p{N}][\\p{Ll}\\p{Lm}\\p{Lo}\\p{N}_-]*';
-const SLUG_EDGE = '[\\p{L}\\p{M}\\p{N}_/-]';
-const SLUG_IN_TEXT_RE = new RegExp(`(?<!${SLUG_EDGE})${SLUG_SEG}(?:/${SLUG_SEG})+(?!${SLUG_EDGE})`, 'gu');
+/** Slugs written verbatim in the fact text ("people/alice-example owns the checklist"). */
+// Match the whole path, including Unicode letters and combining marks. An
+// ASCII-only match can turn people/alice中文 into the different people/alice.
+const SLUG_TEXT_CHARS = `${SLUG_WORD_CHARS}._\\-`;
+const SLUG_IN_TEXT_RE = new RegExp(
+  `(?<![\\p{L}\\p{N}\\p{M}._/\\-])[${SLUG_WORD_CHARS}][${SLUG_TEXT_CHARS}]*(?:/[${SLUG_WORD_CHARS}][${SLUG_TEXT_CHARS}]*)+(?![\\p{L}\\p{N}\\p{M}._/\\-])`, 'gu');
 
 /** Two distinct entities already make the subject unknown; more resolution is wasted work. */
 const DISTINCT_ENTITY_LIMIT = 2;
 
 export async function inferFactSubject(engine: BrainEngine, sourceId: string, input: InferSubjectInput): Promise<InferResult> {
-  const candidates: Array<{ query: string; sentenceStart?: true }> = [
-    ...[...new Set(input.fact.match(SLUG_IN_TEXT_RE) ?? [])].map(query => ({ query })),
+  const candidates: Array<{ query: string; sentenceStart?: true; literalPath?: true }> = [
+    ...[...new Set(input.fact.match(SLUG_IN_TEXT_RE) ?? [])].map(query => ({ query, literalPath: true as const })),
     ...extractCandidates(input.fact).filter(c => !c.weak).map(shedOpener),
   ];
   const resolved = new Set<string>();
@@ -136,6 +133,11 @@ export async function inferFactSubject(engine: BrainEngine, sourceId: string, in
     if (!r) {
       r = await resolveStrictEntityReference(engine, sourceId, candidate.query,
         { sameName: input.mode === 'relink', excludePrivate: input.excludePrivate });
+      if (candidate.literalPath && r.slug === null && r.miss === 'no_page') {
+        const normalized = candidate.query.replace(/\.$/, '').replace(/\.md$/, '');
+        if (normalized !== candidate.query) r = await resolveStrictEntityReference(engine, sourceId, normalized,
+          { sameName: input.mode === 'relink', excludePrivate: input.excludePrivate });
+      }
       memo.set(key, r);
     }
     if (r.slug !== null) {

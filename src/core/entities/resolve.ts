@@ -368,7 +368,10 @@ export async function resolveStrictEntityReference(
     return await isEntity(rows[0]) ? { slug: rows[0].slug, arm } : { slug: null, miss: 'not_entity' };
   };
 
-  if (looksLikeSlug(trimmed)) {
+  // An explicit stored path is identity evidence even when it contains dots
+  // or combining marks outside the legacy free-name slug classifier. This
+  // lookup still requires the complete live, readable entity in this source.
+  if (trimmed.includes('/') || looksLikeSlug(trimmed)) {
     const exact = await pick(await live([trimmed]), 'exact_page');
     if (exact) return exact;
   }
