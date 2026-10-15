@@ -938,6 +938,11 @@ Two read-only doctor checks watch the receipt-bytes accounting:
   statement, and reports `persistence.true_up.clamped`, the number of
   settle-time decrements that were clamped at zero. A positive delta charges
   capacity no receipt holds; a negative one under-counts. It changes nothing.
+  Inspect `details.drift` in the Doctor JSON first. The optional host preview
+  `gbrain repair receipt-counter-reconcile --json` saves approval metadata but does not change counters;
+  applying its exact `--expect` hash reconciles only receipt-byte counters,
+  preserving every receipt, lifetime ID and replay key. A changed accounting
+  snapshot refuses `preview_changed`; no compaction or retention change occurs.
 - `persistence_compaction` reads `persistence.maintenance.last_compaction`,
   the record each resident consumer's compaction pass writes (`at`,
   `host_id`, `compacted`, `freed_bytes`, `skipped_by_reason`), and warns when

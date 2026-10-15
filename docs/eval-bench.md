@@ -632,9 +632,11 @@ default and does not apply to the reader; each row records
 The original reader used `max_tokens` 512 with an abstention instruction
 (disclosed deviation from the official reading prompt). New runs default to
 brief evidence notes before a concise answer, with `max_tokens` 1024.
-`--reader-mode direct` retains the original system text and 512-token budget;
-`--reader-mode notes --reader-max-tokens 512` reproduces the measured treatment's
-original output cap. The notes mode changes only the final system instruction:
+`--reader-mode direct` uses a terse answer style with a default 512-token budget;
+notes defaults to 1024. Both current prompts carry the `literal-label-lab-v1`
+version suffix and differ from the historical v3/v4 prompts. Setting notes to
+512 matches the historical output cap, not the historical prompt or accuracy.
+The two current modes differ in their final system instruction:
 the sanitizer, sessions, dates, evidence order and abstention boundary are
 unchanged. A `max_tokens` finish is recorded as `reader_max_tokens`, with no
 completed hypothesis or judge verdict; its question still counts as an error in
@@ -745,9 +747,12 @@ reader pins and the judge pins all land on one receipt.
   output tokens 1024 in the default notes mode (512 in the original direct
   mode; official 500). `reader_mode`, `reader_prompt_version`,
   `reader_prompt_sha`, `reader_max_tokens`, `reader_config_hash` and
-  `reader_finish_reason` pin the configuration and completion. A historical
-  direct receipt can resume only with explicit `--reader-mode direct`;
-  `--allow-mixed-run-config` cannot mix reader modes or budgets.
+  `reader_finish_reason` pin the configuration and completion. A receipt can
+  resume only with its exact reader configuration. Historical v3/v4 receipts
+  do not match the current literal-label prompts, even with explicit
+  `--reader-mode direct`; use a fresh output file for the current protocol or
+  the original pinned checkout to reproduce a historical run.
+  `--allow-mixed-run-config` cannot override this reader guard.
 - **Confidence intervals are question-sampling only.** `ci95_bootstrap` is a
   seeded percentile bootstrap over the headline 0/1 vector (10,000 resamples,
   seed 42), labelled `question-sampling only`: it says how much the number
@@ -844,14 +849,14 @@ Unknown flags exit 1 before any work starts.
 | `--expansion-replay FILE` | off | Serve the `expansion_variants` recorded in FILE (a prior `--expansion` run) instead of calling the LLM, so cells differ only in their knobs; implies `--expansion`. A question missing from FILE is an `expansion_replay_miss` error row and the run exits 1 |
 | `--expansion-variant-budget B` | not pinned | Pin `search.expansion_variant_budget`: `legacy` (every RRF list weight 1) or a number in (0, 4] — the total RRF weight shared by the expansion variant lists (the original list always keeps weight 1) |
 | `--top-k K` | 8 | Retrieve K chunk rows per question; `recall_*@k` is scored over the distinct sessions among those K rows (the published rows use `--top-k 5`) |
-| `--reader-mode direct\|notes` | notes | Notes-first evidence extraction and reasoning followed by a concise answer; `direct` preserves the original v3 reader prompt and 512-token output cap. This is an eval-reader default, not a `gbrain think` change |
-| `--reader-max-tokens N` | 1024 for notes; 512 for direct | Positive integer reader output cap; notes with 512 reproduces the measured treatment's original budget, including cutoff risk. `max_tokens` completions fail rather than scoring partial text |
+| `--reader-mode direct\|notes` | notes | Notes-first evidence extraction and reasoning followed by a concise answer; `direct` uses a terse answer style and a default 512-token output cap. Both modes use the versioned literal-label candidate prompts, not the historical v3/v4 prompt bytes. This is an eval-reader default, not a `gbrain think` change |
+| `--reader-max-tokens N` | 1024 for notes; 512 for direct | Positive integer reader output cap; notes with 512 matches the historical output budget, including cutoff risk, but does not reproduce the historical prompt. `max_tokens` completions fail rather than scoring partial text |
 | `--mode M` | `balanced` (or an injected config snapshot) | Search mode `conservative` / `balanced` / `tokenmax`, resolved through `src/core/search/mode.ts` so retrieval matches production under that mode. No mode implies `--expansion` |
 | `--reranker on\|off` | not pinned (bundle decides) | Pin `search.reranker.enabled` for the run (beats any injected snapshot and any `--search-pin` on the key). The reranker gate keys on the RESOLVED pin — flag, `--search-pin`, snapshot or bundle: whenever the run resolves to reranker on, readiness is preflighted (exit 2 with the fix if it cannot run) and the run exits non-zero if any row fell through un-reranked (`reranker_skipped_rows`). A `balanced`/`tokenmax` run with no `VOYAGE_API_KEY` therefore refuses to start (exit 2 with the fix text; a resume holding un-reranked rows exits 1) — pass `--reranker off` or set the key. A run in which every question errored also exits 1 |
 | `--autocut on\|off` | not pinned (bundle decides) | Pin `search.autocut` for the run (beats any injected snapshot) |
 | `--search-pin KEY=VALUE` | none | Pin any `search.*` config key for the run (repeatable, e.g. `--search-pin search.metadata_boost_gate=always`). The raw pin map folds into `retrieval_config_hash` (so a resumed file cannot mix pin sets); the knobs hash covers only the mode knobs the pins resolve into. Explicit flags (`--mode`, `--reranker`, `--autocut`, `--expansion-variant-budget`) win over a `--search-pin` on the same key. Unknown keys are set verbatim — check `gbrain search modes` to confirm a key exists |
 | `--output FILE` | stdout | Write JSONL to FILE |
-| `--resume-from FILE` | off | Skip `question_id`s already present in FILE (usually the `--output` path, which then appends). Prior rows are re-scored from their `retrieved[]` + the dataset gold; different reader mode, model, prompt or token budget is always refused. Use `--reader-mode direct` for historical direct receipts |
+| `--resume-from FILE` | off | Skip `question_id`s already present in FILE (usually the `--output` path, which then appends). Prior rows are re-scored from their `retrieved[]` + the dataset gold; different reader mode, model, prompt or token budget is always refused. Historical v3/v4 prompt receipts are incompatible with current literal-label prompts, including in direct mode; use a fresh output file or the original pinned checkout |
 | `--allow-mixed-run-config` | off | Resume even when FILE rows carry a different `retrieval_config_hash`; never overrides the reader configuration guard |
 | `--question-ids FILE` | all | Run only the listed `question_id`s (one per line, `#` comments); unknown ids or an empty file exit 1. Dev-slice / held-out discipline (`evals/longmemeval/`) |
 | `--no-trajectory` | off | Skip the Haiku claim extractor AND the per-question intent routing (like-for-like retrieval receipts) |
@@ -1240,10 +1245,13 @@ score for your brain. It answers the 10 committed questions in
 `test/fixtures/longmemeval-nightly.jsonl` from an isolated in-memory
 benchmark brain, with your search mode, reranker and model routes, and has
 three judges grade the answers. It uses the direct reader (`--reader-mode
-direct`, the original terse prompt and 512-token budget), because the judges
+direct` with an explicit 1024-token output cap and the current versioned
+literal-label prompt), because the judges
 grade directness and the default notes reader's notes and reasoning would be
 graded as the answer (#6627). Standalone `gbrain eval longmemeval` runs keep
-the notes default. A PASS says the retrieval-plus-answer
+the notes default (1024 tokens; standalone direct defaults to 512). The
+literal-label prompt change and explicit nightly cap are candidate protocol
+changes; unit tests do not establish a quality improvement. A PASS says the retrieval-plus-answer
 pipeline and the judges work end to end tonight; it says nothing about the
 pages in your own brain. The fixture is embedded in the gbrain binary, so
 source checkouts and compiled installs run the same probe.

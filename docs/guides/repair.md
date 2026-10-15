@@ -144,6 +144,7 @@ work behind exits 0, so scripts should also check `results[].complete`.
 | `contextual-mode` | `contextual_retrieval_coverage` (pages with no recorded mode) | Stamps the contextual retrieval mode on markdown pages imported without one (for example by a large `--no-embed` sync, or by a connector source on an older gbrain), exactly as a fresh import of the page would: the page, source and brain settings decide, and the per-chunk synopsis tier lands at the free title tier. It rebuilds projections only: no page write, no new page version and no request ID. A page whose stored vectors already match the stamped convention keeps them and queues no re-embedding; a page whose embedding input changes has only those vectors cleared and is re-embedded once, unless you pass `--no-embed`. | `unsealed_projection`: pages whose chunks lag their text; `gbrain embed --stale` or `safe-chunks` seals them first, and the next run stamps them. `embed_skip`: pages marked to skip embedding keep their stored vectors and are not stamped. |
 | `file-drift` | `maintenance_write_drift` | Explicit-only, preview-bound. Resolves pages whose canonical file differs from the database copy (`source_changed` / `file_database_drift`) through canonical reconciliation, preferring the file or the database copy within reconcile's protections. `--all-drifted` refuses mixed drift classes unless `--class` keeps one; `--only`/`--skip` narrow by canonical file path glob. Opt-in `storage.keep_db` lets the owner host's resident consumer resolve drift under declared prefixes with the database copy. See [file drift](#file-drift). | Protected metadata, the tag union and protected takes or private fact rows, listed per page as `exceptions`; pages changed after the preview (`changed_since_preview`). |
 | `ghost-pages` | `ghost_pages` | Explicit-only, preview-bound, destructive consent. Soft-deletes live pages whose canonical file is missing on the owner host (ghost pages: every write refuses `canonical_file_missing` and no sync can import a file that is not there), through `delete_page` bound to the previewed owner, path and revision. `--apply --expect <hash> --yes`. See [ghost pages](#ghost-pages). | Declared db_only and never-filed derived pages (never listed); a page whose file came back before the apply (`file_restored`); pages changed after the preview (`changed_since_preview`). |
+| `receipt-counter-reconcile` | `persistence_counter_drift` | Explicit-only, trusted host-only, preview-bound. Recomputes brain and principal receipt-byte counters from all request and lifecycle reservations under the existing journal counter locks. No receipt, lifetime ID, replay key, retention or other counter is changed. | A changed accounting snapshot refuses `preview_changed`; a missing counter row refuses recovery rather than guessing its lifetime IDs. |
 | `receipt-compaction` | `persistence_capacity` (terminal bytes) | Explicit-only, preview-bound, destructive consent. Compacts terminal write receipts now instead of on the idle maintenance tick (#6696): the intent and error message are dropped, the outcome, error code and detail stay, and the unused reservation returns to the receipt-bytes counters. `--older-than <72h\|30d>` is floored at the configured retention unless `--force`; committed receipts only unless `--include-failures`. No admission, so it runs at a full cap. See [receipt compaction](#receipt-compaction). | `failures_kept`: failed, conflict and cancelled receipts left without `--include-failures`. Receipts of a run whose sync cursor is still open, and the newest sync receipt of each worktree, are never listed. |
 | `aliases` | `dangling_aliases` (orphaned rows) | Explicit-only. Deletes free-text page aliases and slug redirects whose target page has no row at all (a page purged before purge removed its aliases, #6619, or a hard-deleted page), each target rechecked under its page lock; a coordinated maintenance write on a managed brain. A redirect from an old name of a page that still exists is never touched. See [aliases](#aliases). | `soft_deleted_target`: aliases of a soft-deleted page, kept for `gbrain restore` and removed when the page is purged. |
 
@@ -244,6 +245,39 @@ warns when that date is less than 90 days away and prints the exact
 one more year, the same value `persistence_capacity` prints) and the check to
 re-run. Request IDs are permanent, so raising the limit is the intervention;
 nothing is evicted.
+
+<a id="receipt-counter-reconcile"></a>
+### Receipt counter reconciliation
+
+`gbrain repair receipt-counter-reconcile` repairs existing positive or negative
+receipt-byte accounting drift. Run it explicitly on the brain host:
+
+```bash
+gbrain repair receipt-counter-reconcile --json
+gbrain repair receipt-counter-reconcile --apply --expect <preview-hash>
+gbrain doctor --only persistence_counter_drift --json
+```
+
+The preview saves an approval checkpoint and prints exact bigint totals. The
+apply takes the existing brain counter lock first, then principal counter
+locks in the journal's order, and verifies the approved accounting snapshot
+before updating only `terminal_bytes`. Requests in every state and lifecycle
+receipts contribute their existing reservations. It neither sizes reservations
+down nor compacts or deletes receipts. Intents, outcomes, errors, lifetime IDs,
+replay keys, worktree counters and retention remain unchanged. A repeated
+successful apply is a no-op while its approval remains fresh.
+
+A new admission or changed reservation after the preview refuses
+`preview_changed`, leaving counters untouched; preview again. A database error
+rolls back the entire update. A missing counter row refuses `storage_error`:
+reconstructing its lifetime and replay accounting needs separate recovery.
+The transaction uses a 2 s lock timeout and 15 s statement timeout; a timeout
+changes nothing. Remote callers and unset trust are refused before storage
+initialization in the repair handler. This handler introduces no schema migration,
+admission, embedding or paid call; normal CLI connection/startup behavior still
+applies, including pending migrations before the handler runs.
+This reconciles existing accounting; it does not establish which historical
+operation originally introduced the discrepancy.
 
 <a id="receipt-compaction"></a>
 ### Receipt compaction
@@ -357,7 +391,7 @@ the item's error code names, then re-attempt. See
 
 <a id="repair-connector-symptoms"></a>
 
-**Who acts** and **Consent** follow the [troubleshooting legend](troubleshooting.md#symptom-table): Preview and Verify are read-only; run Apply only once the named actor has it and the user agreed to the listed effects.
+**Who acts** and **Consent** follow the [troubleshooting legend](troubleshooting.md#symptom-table): Verify reads state. Preview does not apply the proposed repair, but preview-bound commands can save approval checkpoint metadata: `receipt-counter-reconcile` does so explicitly. Check each command’s preview effects before running it; run Apply only once the named actor has it and the user agreed to the listed effects.
 
 | Symptom | Preview | Apply | Verify | Who acts | Consent |
 | --- | --- | --- | --- | --- | --- |
