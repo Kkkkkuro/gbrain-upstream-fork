@@ -3,6 +3,8 @@
  */
 import type { BrainEngine } from '../../engine.ts';
 import type { MinionHandler } from '../types.ts';
+import { UnrecoverableError } from '../errors.ts';
+import { throwIfAborted } from '../../abort-check.ts';
 
 /**
  * v0.42.x (#1685 GAP D) — PROTECTED bounded extract_atoms backlog drain.
@@ -16,9 +18,24 @@ export function makeExtractAtomsDrainHandler(engine: BrainEngine): MinionHandler
   return async (job) => {
     if (job.data.retryRequestId !== undefined) {
       if (typeof job.data.retryRequestId !== 'string' || typeof job.data.sourceId !== 'string') throw new Error('Atom retry requires sourceId and retryRequestId strings.');
+      throwIfAborted(job.signal);
+      const expired = () => job.deadlineAtMs != null && Date.now() >= job.deadlineAtMs;
+      if (expired()) throw new UnrecoverableError('extract-atoms-drain: retry job deadline reached');
       const { retryManagedAtomBatch } = await import('../../persistence/atom-retry.ts');
-      return retryManagedAtomBatch(engine, job.data.sourceId, job.data.retryRequestId, `job:${job.id}`,
-        { signal: job.signal, deadlineAtMs: job.deadlineAtMs });
+      try {
+        return await retryManagedAtomBatch(engine, job.data.sourceId, job.data.retryRequestId, `job:${job.id}`,
+          { signal: job.signal, deadlineAtMs: job.deadlineAtMs });
+      } catch (error) {
+        if (expired()) {
+          const stopped = new UnrecoverableError(error instanceof Error ? error.message : String(error));
+          if (error instanceof Error) Object.assign(stopped, { cause: error,
+            ...('writeRequest' in error ? { writeRequest: error.writeRequest } : {}),
+            ...('writeRequests' in error ? { writeRequests: error.writeRequests } : {}),
+            ...('write_requests' in error ? { write_requests: error.write_requests } : {}) });
+          throw stopped;
+        }
+        throw error;
+      }
     }
     const { formatDrainProviderFailure, runExtractAtomsDrainForSource, structuralAtomRefusal } =
       await import('../../cycle/extract-atoms-drain.ts');
@@ -30,7 +47,6 @@ export function makeExtractAtomsDrainHandler(engine: BrainEngine): MinionHandler
       typeof job.data.repoPath === 'string'
         ? job.data.repoPath
         : ((await engine.getConfig('sync.repo_path')) ?? undefined);
-    const { UnrecoverableError } = await import('../errors.ts');
     // #5809: at or past the job's deadline the worker dead-letters the row
     // anyway; a retry would hold the cycle lock for another full timeout.
     const { deadlineAtMs } = job;

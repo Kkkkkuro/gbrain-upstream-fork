@@ -7,6 +7,7 @@ import { atomRetryInputKey, managedAtomSession, publishManagedAtoms, readAtomOri
 import { isWriteReceipt, type WriteReceipt } from './types.ts';
 import { anyAbortSignal } from '../abort-signals.ts';
 import { MaintenanceWriteWait } from './maintenance-wait.ts';
+import { atomPublicationErrorReceipts } from './atom-publication-stop.ts';
 
 const receiptFix = (requestId: string): Action => readFix('Reads the atom request\'s durable receipt: its state, outcome and error, read-only.',
   { argv: ['gbrain', 'write-request', '--', requestId] });
@@ -25,11 +26,11 @@ function stoppedRetry(reason: unknown, receipts: WriteReceipt[]): Error {
       `The retry stopped (${reason instanceof Error ? reason.message : String(reason)}) after atom write ${pending.request_id} was admitted; it may still commit. Inspect its receipt and wait for it to settle before approving another attempt.`,
       { fix: receiptFix(pending.request_id) });
     error.writeRequest = pending;
-    return Object.assign(error, { write_requests: receipts });
+    return Object.assign(error, { cause: reason, write_requests: receipts, writeRequests: receipts, writeRequest: pending });
   }
   if (!receipts.length && reason instanceof Error) return reason;
   return Object.assign(new DOMException(reason instanceof Error ? reason.message : String(reason ?? 'Atom retry aborted'), 'AbortError'),
-    { write_requests: receipts });
+    { cause: reason, write_requests: receipts, writeRequests: receipts, ...(receipts.at(-1) ? { writeRequest: receipts.at(-1) } : {}) });
 }
 
 /**
@@ -38,19 +39,32 @@ function stoppedRetry(reason: unknown, receipts: WriteReceipt[]): Error {
  */
 export async function retryManagedAtomBatch(engine: BrainEngine, sourceId: string, requestId: string, retryId: string,
   opts: { signal?: AbortSignal; deadlineAtMs?: number | null } = {}): Promise<Record<string, unknown>> {
+  const deadline = opts.deadlineAtMs;
+  if (deadline != null && !Number.isFinite(deadline)) throw new RangeError('Invalid atom retry deadline');
+  const deadlineController = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const armDeadline = () => {
+    if (deadline == null || deadlineController.signal.aborted) return;
+    if (Date.now() >= deadline) { deadlineController.abort(new Error('atom retry deadline reached')); return; }
+    timer = setTimeout(armDeadline, Math.min(2 ** 31 - 1, Math.max(1, deadline - Date.now())));
+    timer.unref?.();
+  };
+  armDeadline();
+  const outer = anyAbortSignal([opts.signal, deadlineController.signal].filter(Boolean) as AbortSignal[]);
   let receipts: WriteReceipt[] = [];
   let stop: ReturnType<typeof anyAbortSignal> | undefined;
   const check = () => {
     if (opts.deadlineAtMs != null && Date.now() >= opts.deadlineAtMs) throw stoppedRetry(new Error('Atom retry stopped at the job deadline.'), receipts);
-    const signal = stop?.signal ?? opts.signal;
+    const signal = stop?.signal ?? outer.signal;
     if (signal?.aborted) throw stoppedRetry(signal.reason, receipts);
   };
-  check();
   const { withRefreshingLock } = await import('../db-lock.ts');
   const { cycleLockIdFor } = await import('../cycle.ts');
   try {
+    check();
     return await withRefreshingLock(engine, cycleLockIdFor(sourceId), async lockSignal => {
-      stop = anyAbortSignal(opts.signal ? [opts.signal, lockSignal] : [lockSignal]);
+      try {
+      stop = anyAbortSignal([outer.signal, lockSignal]);
       check();
       const wait = new MaintenanceWriteWait(opts.deadlineAtMs ?? null);
       const session = await managedAtomSession(engine, sourceId, { requestId, retryId }, wait);
@@ -114,7 +128,7 @@ export async function retryManagedAtomBatch(engine: BrainEngine, sourceId: strin
           retirements.push({ slug: row.slug, pageId: row.page_id, revision });
         }
         check();
-        receipts = await publishManagedAtoms(engine, session, current, atoms, undefined, retirements);
+        receipts = await publishManagedAtoms(engine, session, current, atoms, undefined, retirements, { signal: stop.signal, assertActive: check });
         check();
         return { status: 'completed', model_rerun: false, write_requests: receipts };
       }
@@ -141,10 +155,15 @@ export async function retryManagedAtomBatch(engine: BrainEngine, sourceId: strin
         throw error;
       }
       return { ...result, model_rerun: true };
+      } catch (error) {
+        const accepted = atomPublicationErrorReceipts(error);
+        if (accepted.length) receipts = [...new Map([...receipts, ...accepted].map(row => [row.request_id, row])).values()];
+        throw error;
+      }
     }, { ttlMinutes: 5 });
   } catch (error) {
     // Lease loss reported at teardown, after work returned durable receipts.
     if (receipts.length && error instanceof Error && error.name === 'LockStolenError') throw stoppedRetry(error, receipts);
     throw error;
-  } finally { stop?.dispose(); }
+  } finally { stop?.dispose(); outer.dispose(); if (timer) clearTimeout(timer); }
 }

@@ -16,6 +16,7 @@
  * changes. `releasePartialDispositions` runs before discovery with the current
  * cap and clears the records a raised cap supersedes.
  */
+import { createHash } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { SqlEngine } from '../persistence/model.ts';
 import { truncateUtf8 } from '../text-safe.ts';
@@ -46,6 +47,22 @@ export async function resolveExtractAtomsInputCap(engine: BrainEngine): Promise<
 export type ExtractAtomsItem =
   | { kind: 'transcript'; filePath: string; content: string; contentHash: string }
   | ({ kind: 'page' } & AtomPageInput);
+
+/** Raw lineage belongs to the captured input, never the page reread after inference. */
+export function atomRawProvenance(item: ExtractAtomsItem, sourceId: string, promptContent: string) {
+  return {
+    raw_source: item.kind === 'page' ? `gbrain-page://${sourceId}/${item.slug}` : item.filePath,
+    raw_trace: {
+      source_id: sourceId,
+      ...(item.kind === 'page' ? { source_slug: item.slug } : { source_path: item.filePath }),
+      source_hash: item.contentHash,
+      ...(item.kind === 'page' && item.identity ? { source_revision: item.identity.revision } : {}),
+      // Tail windows and paste-stripped transcripts use extractor-input offsets.
+      input_hash: createHash('sha256').update(promptContent).digest('hex'),
+      quote_offset_basis: 'extractor_input_utf16',
+    },
+  };
+}
 
 export interface ExtractAtomsInput {
   /** Exactly the text the model receives; quote provenance verifies against it. */

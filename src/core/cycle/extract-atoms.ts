@@ -69,7 +69,7 @@ import { createGlobalLlmHaltTracker, haltedClassOf, providerContentBlockReason, 
 import { importFromContent } from '../import-file.ts';
 import { derivedWriteThrough } from './derived-write-through.ts';
 import { serializeMarkdown } from '../markdown.ts';
-import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
+import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, atomRawProvenance, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
 import { commitExtractionPlan, readPageWatermark } from '../extraction-watermark.ts';
 import { claudeCliSelfSessionIds } from '../ai/providers/claude-cli-scratch.ts';
 import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
@@ -91,6 +91,7 @@ import { managedAtomSession, readAtomOrigin, resumeManagedAtoms, publishManagedA
 import { effectiveVisibility } from '../search/private-visibility.ts';
 import { OperationError } from '../ops/contract.ts';
 import type { WriteReceipt } from '../persistence/types.ts';
+import { atomPublicationErrorReceipts } from '../persistence/atom-publication-stop.ts';
 import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 import { AtomPageStateError, completeAtomReceipts, MAX_DETERMINISTIC_FAILURES, readAtomPageIdentity, writeAtomPageState, type AtomPageInput } from './extract-atoms-page-state.ts';
 import { maintenanceTransaction } from '../persistence/attribution.ts';
@@ -1118,7 +1119,7 @@ export async function runPhaseExtractAtoms(
       const parseOutcome = parseAtomsOutcome(result.text, result.stopReason);
       if (!parseOutcome.ok) {
         if (parseOutcome.stopped) stoppedOutputs++; else malformedOutputs++;
-        if (!opts.dryRun && managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, [], parseOutcome.reason));
+        if (!opts.dryRun && managed && origin) writeRequests.push(...await publishManagedAtoms(engine, managed, origin, [], parseOutcome.reason, undefined, { signal: opts.signal }));
         await recordDeterministicFailure(item, originLabel, parseOutcome.stopped ? parseOutcome.reason : `malformed model output: ${parseOutcome.reason}`);
         continue;
       }
@@ -1143,7 +1144,7 @@ export async function runPhaseExtractAtoms(
         // row is (source_id, file_path, content_hash)-keyed, so editing the
         // file re-eligibilizes it — which is what makes the permanence safe.
         if (!opts.dryRun) {
-          const published = managed && origin ? await publishManagedAtoms(engine, managed, origin, []) : [];
+          const published = managed && origin ? await publishManagedAtoms(engine, managed, origin, [], undefined, undefined, { signal: opts.signal }) : [];
           writeRequests.push(...published);
           if (!origin && truncated) await recordPartialDisposition(engine, sourceId, item, maxInputChars);
           else if (!origin && item.kind === 'page') await stampAtomsScanHash(item);
@@ -1226,6 +1227,7 @@ export async function runPhaseExtractAtoms(
             {
               atom_type: atom.atom_type,
               ...originFrontmatter,
+              ...atomRawProvenance(item, sourceId, promptContent),
               // Provisional until the whole item's atoms persist (see above).
               source_hash: `pending:${hash16}`,
               visibility, ...(origin ? { managed_extraction: true } : {}),
@@ -1282,7 +1284,7 @@ export async function runPhaseExtractAtoms(
         if (managed && origin) {
           for (const atom of managedAtoms) atom.links = provenanceLinks.filter(link => link.to_slug === atom.slug);
           throwIfAborted(opts.signal, 'extract_atoms');
-          const published = await publishManagedAtoms(engine, managed, origin, managedAtoms);
+          const published = await publishManagedAtoms(engine, managed, origin, managedAtoms, undefined, undefined, { signal: opts.signal });
           writeRequests.push(...published);
           if (published.some(receipt => receipt.state !== 'committed')) writesPending++;
           totalAtomsExtracted += managedAtoms.length;
@@ -1313,7 +1315,7 @@ export async function runPhaseExtractAtoms(
       // Reporter rate-limits to ~1 line/sec; safe to tick every iter.
       opts.progress?.tick(1, `${totalAtomsExtracted} atoms / ${duplicatesSkipped} skipped`);
     } catch (err) {
-      if (err instanceof OperationError && err.writeRequest) writeRequests.push(err.writeRequest);
+      writeRequests.push(...atomPublicationErrorReceipts(err));
       if (acceptedPendingReceipt(err)) { writesPending++; continue; }
       if (opts.signal?.aborted) {
         stoppedEarly = true;

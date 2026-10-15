@@ -16,10 +16,14 @@ let read = async () => ({ page: { compiled_truth: 'Synthetic origin' } });
 let phase: (opts: any) => Promise<any>;
 let publish: () => Promise<WriteReceipt[]>;
 let saved = false;
+let loseAtTeardown = false;
 const origin = { kind: 'page', locator: 'notes/example', contentHash: 'same' };
 let session: any;
 mock.module('../src/core/db-lock.ts', () => ({
-  withRefreshingLock: async (_engine: unknown, _id: string, work: (signal: AbortSignal) => Promise<unknown>) => work(lock.signal),
+  withRefreshingLock: async (_engine: unknown, _id: string, work: (signal: AbortSignal) => Promise<unknown>) => {
+    try { return await work(lock.signal); }
+    finally { if (loseAtTeardown) throw Object.assign(new Error('lease lost at teardown'), { name: 'LockStolenError' }); }
+  },
 }));
 mock.module('../src/core/cycle.ts', () => ({ cycleLockIdFor: (source: string) => `cycle:${source}` }));
 mock.module('../src/core/persistence/atom-maintenance.ts', () => ({
@@ -44,7 +48,7 @@ const engine = { readPageSnapshot: async (slug: string) => slug === 'atoms/examp
 const job = (signal: AbortSignal, deadlineAtMs?: number) => ({ id: 42, data: { sourceId: 'default', retryRequestId: 'synthetic-retry' }, signal, deadlineAtMs }) as unknown as MinionJobContext;
 const receipt = (state: 'queued' | 'committed'): WriteReceipt => ({ request_id: '11111111-1111-4111-8111-111111111111', state, retry_after_ms: state === 'queued' ? 100 : null });
 beforeEach(() => {
-  lock = new AbortController(); sessions = phases = publications = 0; saved = false;
+  lock = new AbortController(); sessions = phases = publications = 0; saved = false; loseAtTeardown = false;
   read = async () => ({ page: { compiled_truth: 'Synthetic origin' } });
   phase = async () => ({ status: 'ok' }); publish = async () => [];
 });
@@ -115,4 +119,29 @@ test('four-argument retry remains compatible and removes caller listeners on suc
   expect(await makeExtractAtomsDrainHandler(engine)(job(caller.signal))).toMatchObject({ model_rerun: true });
   expect(added.mock.calls.length).toBeGreaterThan(0);
   expect(removed.mock.calls.length).toBe(added.mock.calls.length);
+});
+
+for (const states of [['queued'], ['committed'], ['queued', 'committed']] as const) test(`lease teardown preserves all ${states.join('/')} receipts`, async () => {
+  saved = true; loseAtTeardown = true;
+  const receipts = states.map((state, i) => ({ ...receipt(state), request_id: `22222222-2222-4222-8222-${String(i).padStart(12, '0')}` }));
+  publish = async () => receipts;
+  const error: any = await retryManagedAtomBatch(engine, 'default', 'synthetic-retry', 'retry').catch(e => e);
+  expect(error.write_requests).toEqual(receipts); expect(error.writeRequests).toEqual(receipts);
+  expect(error.cause.name).toBe('LockStolenError');
+  if (states.includes('queued' as never)) { expect(error.code).toBe('write_pending'); expect(error.writeRequest).toEqual(receipts[0]); }
+  else { expect(error.name).toBe('AbortError'); expect(error.code).not.toBe('cancelled'); }
+});
+test('teardown cannot discard receipts retained by a publication error', async () => {
+  saved = true; loseAtTeardown = true;
+  const receipts = [receipt('queued')];
+  publish = async () => { throw Object.assign(new Error('stopped during publication'), { writeRequests: receipts }); };
+  const error: any = await retryManagedAtomBatch(engine, 'default', 'synthetic-retry', 'retry').catch(e => e);
+  expect(error.write_requests).toEqual(receipts); expect(error.writeRequests).toEqual(receipts); expect(error.code).toBe('write_pending');
+});
+test('mixed cancellation selects the pending receipt even when the last receipt committed', async () => {
+  const caller = new AbortController();
+  const receipts = [receipt('queued'), { ...receipt('committed'), request_id: '33333333-3333-4333-8333-333333333333' }];
+  phase = async () => { caller.abort(new Error('mixed stop')); return { status: 'ok', details: { write_requests: receipts } }; };
+  const error: any = await retryManagedAtomBatch(engine, 'default', 'synthetic-retry', 'retry', { signal: caller.signal }).catch(e => e);
+  expect(error.write_requests).toEqual(receipts); expect(error.writeRequest).toEqual(receipts[0]); expect(error.code).toBe('write_pending');
 });

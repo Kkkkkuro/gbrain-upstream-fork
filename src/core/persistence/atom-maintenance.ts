@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { throwIfAborted } from '../abort-check.ts';
+import { assertAtomPublicationActive } from './atom-publication-stop.ts';
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { OperationContext } from '../ops/contract.ts';
@@ -14,7 +16,7 @@ import { digest, requireUuid, sha256 } from './digest.ts';
 import { getWorktreeBinding, managedPersistenceEnabled, probeWorktreeWriter, type WorktreeBinding } from './ownership.ts';
 import { isConnectorSourceKind } from './connector-identity.ts';
 import { preparePageMutation } from './page-prepare.ts';
-import { assertPersistenceAccepting, waitForWrite, writeResponse } from './service.ts';
+import { assertPersistenceAccepting, awaitWrite, waitForWrite, writeResponse } from './service.ts';
 import { MaintenanceWriteWait } from './maintenance-wait.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import type { WriteAuthority, WriteRequest } from './model.ts';
@@ -384,16 +386,23 @@ export interface ManagedAtomRetirement {
   revision: string;
 }
 
+/** Producer cancellation and synchronous deadline/ownership checks before admission. */
+export interface ManagedAtomPublicationOptions { signal?: AbortSignal; assertActive?: () => void }
+
 export async function publishManagedAtoms(engine: BrainEngine, session: ManagedAtomSession, origin: AtomOrigin,
   atoms: Array<{ slug: string; content: string; links: LinkBatchInput[]; expectedTarget?: { pageId: number | null; revision: string | null } }>,
-  failure?: string, reviewedRetirements?: ManagedAtomRetirement[]): Promise<WriteReceipt[]> {
+  failure?: string, reviewedRetirements?: ManagedAtomRetirement[], opts: ManagedAtomPublicationOptions = {}): Promise<WriteReceipt[]> {
+  const guard = () => { throwIfAborted(opts.signal); opts.assertActive?.(); };
+  guard();
   const claim = atomClaim(session, origin);
   const key = claim.runKey;
   const advance = claim.checkpointKey ? { checkpointKey: claim.checkpointKey, expectedCheckpoint: claim.expectedCheckpoint ?? null } : {};
   const inputs: Array<{ slug: string; pageId: number | null; intent: AtomIntent }> = [];
   for (const atom of atoms) {
     await authorizeWrite(engine, session.authority, 'put_page', atom.slug);
+    guard();
     const snapshot = await engine.readPageSnapshot(atom.slug, { sourceId: session.sourceId, includeDeleted: true });
+    guard();
     if (snapshot && ((snapshot.page.deleted_at && !snapshot.page.frontmatter.retired_by) || snapshot.page.type !== 'atom' ||
       (origin.kind === 'page' ? snapshot.page.frontmatter.source_slug !== origin.locator : snapshot.page.frontmatter.source_path !== origin.locator))) {
       throw opError('page_identity_changed', 'The atom target belongs to another origin or was removed.',
@@ -422,39 +431,54 @@ export async function publishManagedAtoms(engine: BrainEngine, session: ManagedA
       ORDER BY slug`,
     [session.sourceId, origin.locator, origin.contentHash.slice(0, 16), atoms.map(atom => atom.slug)],
   );
+  guard();
   for (const retirement of retirements) {
     await authorizeWrite(engine, session.authority, 'delete_page', retirement.slug);
+    guard();
     inputs.push({ slug: retirement.slug, pageId: retirement.pageId, intent: {
       kind: 'managed_atom_delete', runKey: key, origin, expected_revision: retirement.revision, ...advance,
     } as AtomIntent });
   }
+  guard();
   const rows = await engine.transaction(async tx => {
+    guard();
     const children: string[] = [];
     const accepted: WriteRequest[] = [];
     for (const input of [...inputs, { slug: '__managed_atom_complete__', pageId: null,
       intent: { kind: 'managed_atom_complete', runKey: key, origin, children, ...(failure ? { failure } : {}), ...advance } as AtomIntent }]) {
+      guard();
       const requestId = atomRequestId(key, input.slug);
       const row = await admitWriteInTransaction(tx, { principal: session.authority.principal, authority: session.authority,
         operation: 'submit_job', sourceId: session.sourceId, sourceIncarnation: session.incarnation,
         worktreeId: session.binding?.worktree_id, topologyGeneration: session.binding?.topology_generation,
         slug: input.slug, pageId: input.pageId, requestId, callerIntent: input.intent, intent: input.intent });
+      guard();
       accepted.push(row);
       if (input.intent.kind !== 'managed_atom_complete') children.push(row.id);
     }
+    guard();
     return accepted;
   });
-  const receipts: WriteReceipt[] = [];
-  for (const row of rows) {
-    const finished = session.wait.observe(await waitForWrite(engine, row, session.config, session.wait.ms()));
+  // Commit is the admission boundary. Stops after it keep ALL accepted receipts.
+  const receipts: WriteReceipt[] = rows.map(row => receiptFor(row));
+  for (let index = 0; index < rows.length; index++) {
+    assertAtomPublicationActive(guard, receipts);
+    const row = rows[index];
+    let finished: WriteRequest;
+    try {
+      finished = session.wait.observe(opts.signal
+        ? (await awaitWrite(engine, row, session.config, { waitMs: session.wait.ms(), signal: opts.signal })).row
+        : await waitForWrite(engine, row, session.config, session.wait.ms()));
+    } catch (error) { assertAtomPublicationActive(guard, receipts); throw error; }
+    receipts[index] = receiptFor(finished);
+    assertAtomPublicationActive(guard, receipts);
     try { writeResponse(finished); }
     catch (error) {
       // #5601: an accepted batch still publishing is progress; its deterministic request ids resume it next run.
       const pending = acceptedPendingReceipt(error);
       if (!pending) throw error;
-      receipts.push(pending);
-      continue;
+      receipts[index] = pending;
     }
-    receipts.push(receiptFor(finished));
   }
   return receipts;
 }
