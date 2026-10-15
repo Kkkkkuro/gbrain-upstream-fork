@@ -2547,3 +2547,30 @@ operator pins, the grant's snapshot and `GBRAIN_MCP_FORCE_SURFACE` all hold.
 - [Concurrent writes and durable receipts](concurrent-writes.md) — receipts, retries and capacity limits
 - [v0.60.5.0 upgrade steps](../../skills/migrations/v0.60.5.0.md) — backup-first upgrade steps for a brain older than v0.60.5.0
 - [Topologies: claim and activate runbook](../architecture/topologies.md#claim-and-activate-runbook) — quiescence checklist, the writer admin lock
+
+
+## Retained atom retries without an extraction-model fallback
+
+A worker implementing `replayOnly` accepts an explicit `extract-atoms-drain`
+retry with params `sourceId`, `retryRequestId` and `replayOnly: true`. It may
+finish an already-completed batch or republish retained atom pages/retirements
+under the existing source/input/target checks. When the batch instead needs
+new extraction-model output, it refuses `consent_required` before calling the
+model. Missing or expired retained content and changed targets still refuse;
+the option does not loosen those checks. Non-boolean values, or the option
+without `retryRequestId`, refuse before starting a drain.
+
+This is an opt-in worker contract. Omitting the option or setting it to false
+retains the ordinary retry behavior, including a model rerun where applicable;
+that path needs its own paid approval. Verify every eligible worker runs a
+build implementing this contract before submitting it: older workers can
+ignore unknown params. `jobs submit --dry-run` only echoes submission data;
+it does not inspect the retained batch or prove replay eligibility.
+
+Replay-only is not a zero-cost guarantee. Republishing retained pages may
+queue embedding and Git effects, which need their own authorization and
+independent receipt/effect verification. A new job can use the existing
+`--max-attempts 1 --max-stalled 0` submission bounds; this does not convert
+`jobs retry` on an old job into a single-attempt retry. Inspect admitted write
+receipts before approving another attempt. Historical extraction halts remain
+in their original health window after recovery.

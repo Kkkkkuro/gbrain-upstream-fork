@@ -16,6 +16,10 @@ import { throwIfAborted } from '../../abort-check.ts';
  */
 export function makeExtractAtomsDrainHandler(engine: BrainEngine): MinionHandler {
   return async (job) => {
+    if (job.data.replayOnly !== undefined &&
+      (typeof job.data.replayOnly !== 'boolean' || typeof job.data.retryRequestId !== 'string')) {
+      throw new UnrecoverableError('Atom replayOnly requires a boolean and an explicit retryRequestId; no drain was started.');
+    }
     if (job.data.retryRequestId !== undefined) {
       if (typeof job.data.retryRequestId !== 'string' || typeof job.data.sourceId !== 'string') throw new Error('Atom retry requires sourceId and retryRequestId strings.');
       throwIfAborted(job.signal);
@@ -24,7 +28,7 @@ export function makeExtractAtomsDrainHandler(engine: BrainEngine): MinionHandler
       const { retryManagedAtomBatch } = await import('../../persistence/atom-retry.ts');
       try {
         return await retryManagedAtomBatch(engine, job.data.sourceId, job.data.retryRequestId, `job:${job.id}`,
-          { signal: job.signal, deadlineAtMs: job.deadlineAtMs });
+          { signal: job.signal, deadlineAtMs: job.deadlineAtMs, replayOnly: job.data.replayOnly as boolean | undefined });
       } catch (error) {
         if (expired()) {
           const stopped = new UnrecoverableError(error instanceof Error ? error.message : String(error));

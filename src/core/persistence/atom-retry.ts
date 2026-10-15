@@ -38,7 +38,8 @@ function stoppedRetry(reason: unknown, receipts: WriteReceipt[]): Error {
  * bounds the shared write wait and stops the retry at the next stage boundary.
  */
 export async function retryManagedAtomBatch(engine: BrainEngine, sourceId: string, requestId: string, retryId: string,
-  opts: { signal?: AbortSignal; deadlineAtMs?: number | null } = {}): Promise<Record<string, unknown>> {
+  opts: { signal?: AbortSignal; deadlineAtMs?: number | null; replayOnly?: boolean } = {}): Promise<Record<string, unknown>> {
+  if (opts.replayOnly !== undefined && typeof opts.replayOnly !== 'boolean') throw new TypeError('Atom retry replayOnly must be a boolean');
   const deadline = opts.deadlineAtMs;
   if (deadline != null && !Number.isFinite(deadline)) throw new RangeError('Invalid atom retry deadline');
   const deadlineController = new AbortController();
@@ -134,6 +135,9 @@ export async function retryManagedAtomBatch(engine: BrainEngine, sourceId: strin
       }
       if (!retry.rows.some(row => row.outcome?.failure)) throw opError('invalid_params', 'This failed batch has no malformed extraction to retry.',
         `Atom batch ${requestId} in source ${sourceId} did not fail on malformed model output, so a model rerun cannot fix it; nothing was started. Read its receipt for the recorded error and fix that cause instead.`,
+        { fix: receiptFix(requestId) });
+      if (opts.replayOnly === true) throw opError('consent_required', 'This atom retry needs new model output; replay-only did not start extraction.',
+        `Atom batch ${requestId} in source ${sourceId} has no retained atom pages or retirements to republish. Replay-only refuses the extraction model fallback; inspect the receipt and obtain a separate paid approval before submitting a model-rerun attempt. Retained publication can still queue embedding effects, so replay-only is not a zero-cost guarantee.`,
         { fix: receiptFix(requestId) });
       const { runPhaseExtractAtoms } = await import('../cycle/extract-atoms.ts');
       check();

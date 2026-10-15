@@ -61,3 +61,49 @@ test('healthy retained retry preserves four-argument compatibility and does not 
  publish=async()=>receipts;
  expect(await retryManagedAtomBatch(engine,'default','synthetic','retry')).toEqual({status:'completed',model_rerun:false,write_requests:receipts});expect(models).toBe(0);
 });
+
+
+test('replay-only refuses malformed output before any extraction model call', async () => {
+ await expect(retryManagedAtomBatch(engine,'default','synthetic','retry',{replayOnly:true})).rejects.toMatchObject({code:'consent_required'});
+ expect(models).toBe(0);
+});
+test('the job handler forwards replay-only into the actual retry', async () => {
+ const j=job(new AbortController().signal);j.data.replayOnly=true;
+ await expect(makeExtractAtomsDrainHandler(engine)(j)).rejects.toMatchObject({code:'consent_required'});
+ expect(models).toBe(0);
+});
+test('replay-only without a retained request cannot enter the ordinary paid drain', async () => {
+ const j=job(new AbortController().signal);delete j.data.retryRequestId;j.data.replayOnly=true;
+ await expect(makeExtractAtomsDrainHandler(engine)(j)).rejects.toMatchObject({name:'UnrecoverableError'});
+ expect(lockCalls).toBe(0);expect(reads).toBe(0);expect(models).toBe(0);
+});
+test('a non-boolean replay-only option is refused before direct retry work', async () => {
+ await expect(retryManagedAtomBatch(engine,'default','synthetic','retry',{replayOnly:'true'} as any)).rejects.toThrow(TypeError);
+ expect(lockCalls).toBe(0);expect(models).toBe(0);
+});
+test('a non-boolean replay-only job option is unrecoverable before retry work', async () => {
+ const j=job(new AbortController().signal);j.data.replayOnly='true';
+ await expect(makeExtractAtomsDrainHandler(engine)(j)).rejects.toMatchObject({name:'UnrecoverableError'});
+ expect(lockCalls).toBe(0);expect(models).toBe(0);
+});
+test('replay-only republishes retained output and preserves its durable receipt', async () => {
+ retainedRows=retained();const receipts=[{request_id:'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',state:'committed',retry_after_ms:null}];let publications=0;
+ publish=async()=>{publications++;return receipts};
+ expect(await retryManagedAtomBatch(engine,'default','synthetic','retry',{replayOnly:true})).toEqual({status:'completed',model_rerun:false,write_requests:receipts});
+ expect(publications).toBe(1);expect(models).toBe(0);
+});
+test('replay-only does not loosen the retained target identity guard', async () => {
+ retainedRows=retained();let publications=0;publish=async()=>{publications++;return []};
+ const changed={...engine,readPageSnapshot:async(slug:string)=>slug.startsWith('atoms/')?{page:{id:3,deleted_at:null},revision:'r1'}:{page:{compiled_truth:'Synthetic.'}}};
+ await expect(retryManagedAtomBatch(changed,'default','synthetic','retry',{replayOnly:true})).rejects.toMatchObject({code:'page_identity_changed'});
+ expect(publications).toBe(0);expect(models).toBe(0);
+});
+test('expired retained content cannot fall through to a model in replay-only mode', async () => {
+ retainedRows=retained();delete retainedRows[0].intent.content;let publications=0;publish=async()=>{publications++;return []};
+ await expect(retryManagedAtomBatch(engine,'default','synthetic','retry',{replayOnly:true})).rejects.toMatchObject({code:'storage_error'});
+ expect(publications).toBe(0);expect(models).toBe(0);
+});
+test('explicit false retains the separately authorized model-rerun path', async () => {
+ expect(await retryManagedAtomBatch(engine,'default','synthetic','retry',{replayOnly:false})).toMatchObject({status:'ok',model_rerun:true});
+ expect(models).toBe(1);
+});
