@@ -44,6 +44,10 @@ describe('persistence counter drift and compaction health', () => {
     const drift = await checkPersistenceCounterDrift(engine);
     expect(drift).toMatchObject({ status: 'warn', details: { drift: [{ scope: 'brain', delta: 5000 }], true_up_clamped: 2 } });
     expect(drift.message).toContain('(+5000)');
+    // Following the default machine next step must not create an approval.
+    expect(drift.fix?.argv).toEqual(['gbrain', 'doctor', '--no-migrate', '--only', 'persistence_counter_drift', '--json']);
+    expect(drift.fix?.then).toMatchObject({ ask_user: true, argv: ['gbrain', 'repair', 'receipt-counter-reconcile', '--json'] });
+    expect(drift.fix?.then?.why).toContain('approval checkpoint');
   }), 60_000);
 
   test('a consumer up past the window with no pass warns; a pass records what it freed and clears it; a stale record warns again', run(async engine => {

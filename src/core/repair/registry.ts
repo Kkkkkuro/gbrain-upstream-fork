@@ -67,6 +67,7 @@ import { stuckRecoveryRepair } from './stuck-recovery.ts';
 import { ghostPagesRepair, GHOST_CONSENT_TEXT, GHOST_CONSEQUENCES, GHOST_PURGE_FUSE_HOURS } from './ghost-pages.ts';
 import { receiptCompactionRepair } from './receipt-compaction.ts';
 import { aliasesRepair } from './aliases.ts';
+import { receiptCounterReconcileRepair } from './receipt-counter-reconcile.ts';
 import { ERROR_CATALOGUE, catalogueError } from '../error-catalogue.ts';
 import type { OperationError } from '../ops/contract.ts';
 
@@ -315,6 +316,12 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'each page with its recorded path and revision, bound to the owner; --apply --expect <hash> --yes soft-deletes exactly that set through delete_page, '
       + 'rechecking each file is still absent (a restored file keeps its page and asks for a new preview). Refused when ghosts are over half of the source\'s '
       + `file-backed pages unless GBRAIN_ALLOW_MASS_RECONCILE=1. Purged after ${GHOST_PURGE_FUSE_HOURS} h; ${GHOST_CONSEQUENCES.undo} Runs only when named.`,
+  },
+  'receipt-counter-reconcile': {
+    handler: receiptCounterReconcileRepair, embeds: 'none', checks: ['persistence_counter_drift'], explicit_only: true, preview_bound: true,
+    summary: 'Reconcile receipt-byte counters with the request and lifecycle reservations they account for, under the journal counter locks. '
+      + 'Explicit-only, host-only and preview-bound: --apply --expect <hash>. Preserves every receipt, lifetime ID and replay key. '
+      + 'A changed accounting snapshot refuses preview_changed; no compaction, retention change, admission or paid work. Brain-wide.',
   },
   'receipt-compaction': {
     handler: receiptCompactionRepair, embeds: 'none', checks: ['persistence_capacity'], explicit_only: true, preview_bound: true, consent: 'destructive',

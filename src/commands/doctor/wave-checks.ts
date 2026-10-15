@@ -219,7 +219,7 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     id: 'persistence_counter_drift', resolution: 'operator', registration: 'doctor.ts',
     count: d => (d.drift ?? []).length,
     impact: 'Receipt-bytes counters differ from the receipts they account for',
-    instruction: 'Report the drift with `gbrain doctor --only persistence_counter_drift --json`; the check changes nothing.',
+    instruction: 'Read details.drift and the counter-drift runbook. Optional host repair preview `gbrain repair receipt-counter-reconcile --json` saves approval metadata; its apply is a separate maintenance choice.',
     run: async engine => (await import('./checks/persistence-compaction.ts')).checkPersistenceCounterDrift(engine),
   },
   {

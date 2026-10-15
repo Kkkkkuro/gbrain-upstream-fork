@@ -35,9 +35,10 @@ import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
 import type { RepairKindSpec } from './registry.ts';
 import { acceptedPendingReceipt } from '../persistence/accepted-pending.ts';
 import { repairAdmissionWindow, repairPublicationOwner, settleRepairReceipts, type PendingRepair } from './settle.ts';
+import { trustedCliRequired } from '../ops/op-fix.ts';
 import { RECEIPT_RESERVATION_FLOOR } from '../persistence/receipt-bytes.ts';
 
-export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'google-file-modes', 'stale-atoms', 'extractor-facts', 'conversation-labels', 'captured-facts', 'loop-facts', 'ontology-facts', 'orphan-children', 'failed-writes', 'split-facts', 'frontmatter', 'fences', 'slug-conflicts', 'timeline-comments', 'managed-sync-orphans', 'frontmatter-keys', 'file-drift', 'stuck-recovery', 'ghost-pages', 'receipt-compaction', 'aliases'] as const;
+export const REPAIR_KINDS = ['timeline', 'visibility', 'safe-chunks', 'contextual-mode', 'connector-checkpoints', 'request-indexes', 'connector-fences', 'take-supersession', 'orphan-bindings', 'embedding-effects', 'attribution-backfill', 'planner-stats', 'google-file-modes', 'stale-atoms', 'extractor-facts', 'conversation-labels', 'captured-facts', 'loop-facts', 'ontology-facts', 'orphan-children', 'failed-writes', 'split-facts', 'frontmatter', 'fences', 'slug-conflicts', 'timeline-comments', 'managed-sync-orphans', 'frontmatter-keys', 'file-drift', 'stuck-recovery', 'ghost-pages', 'receipt-compaction', 'aliases', 'receipt-counter-reconcile'] as const;
 export type RepairKind = typeof REPAIR_KINDS[number];
 
 export interface RepairScope { brain_id: string; source_ids: string[] }
@@ -98,6 +99,8 @@ export interface RepairPlanOptions { apply: boolean; expect?: string; includeAmb
 
 export interface RepairHandler {
   kind: RepairKind;
+  /** Trusted host-only administrative repair; checked before local persistence initialization. */
+  localOnly?: true;
   /** `projection`: items rebuild derived rows only and take no journal admission. Default `coordinated`. */
   publication?: 'coordinated' | 'projection';
   /** False for kinds whose items are bookkeeping rows, not pages: no embedding cost. */
@@ -287,6 +290,7 @@ async function runRepairScoped(ctx: OperationContext, handler: RepairHandler, sc
   const { repairSpec, explicitKindRequired } = await import('./registry.ts');
   const spec = opts.spec ?? repairSpec(handler.kind);
   if (spec?.explicit_only && opts.explicit !== true) throw explicitKindRequired(handler.kind);
+  if (handler.localOnly && ctx.remote !== false) throw trustedCliRequired(`gbrain repair ${handler.kind} runs only from the trusted local CLI on the brain host.`);
   if (opts.apply) await initializeLocalPersistence(ctx);
   const { cursor: resumed, runId: storedRunId } = await readCursor(ctx.engine, handler.kind, scope, opts.apply ? opts.expect : undefined);
   const now = opts.now ?? Date.now;

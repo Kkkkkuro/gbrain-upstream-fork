@@ -64,7 +64,12 @@ export async function checkPersistenceCounterDrift(engine: BrainEngine): Promise
     return { name: 'persistence_counter_drift', status: 'warn', details,
       message: `Receipt-bytes counters differ from the receipts they account for: ${drift.map(row => `${row.scope} counter ${row.counter} vs receipts ${row.receipts} (${row.delta > 0 ? '+' : ''}${row.delta})`).join('; ')}. `
         + `A positive delta charges capacity no receipt holds; a negative one under-counts.${clamped ? ` ${clamped} true-up decrement(s) were clamped at zero.` : ''} `
-        + 'Nothing is changed by this check; report it with gbrain doctor --only persistence_counter_drift --json.' };
+        + 'Inspect details.drift and the linked runbook. The optional host repair preview saves an approval checkpoint before any counter apply.',
+      fix: { argv: ['gbrain', 'doctor', '--no-migrate', '--only', 'persistence_counter_drift', '--json'], consent: [], actor: 'agent', requires_exclusive: false,
+        verify: doctorVerify('persistence_counter_drift'), docs: DRIFT_DOCS,
+        why: 'Reads details.drift without changing counters or saving an approval. Reading it does not clear the WARN.',
+        then: { argv: ['gbrain', 'repair', 'receipt-counter-reconcile', '--json'], ask_user: true, consent: [], actor: 'host_admin', requires_exclusive: false,
+          why: 'The host repair preview saves an approval checkpoint; counters stay unchanged. Apply is a separate maintenance choice bound to that preview.', docs: DRIFT_DOCS } } };
   } catch (error) {
     return { name: 'persistence_counter_drift', status: 'warn', message: `Receipt-bytes counters could not be compared: ${error instanceof Error ? error.message : String(error)}. Health is unknown.`,
       details: { health: 'unknown' } };
