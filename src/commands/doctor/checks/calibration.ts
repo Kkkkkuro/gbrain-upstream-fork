@@ -22,7 +22,6 @@ import { escapeLikePattern, buildVisibilityClause } from '../../../core/search/s
 import { safeChunksFilter } from '../../../core/search/safe-chunks.ts';
 import type { Check } from '../../doctor.ts';
 import { checkError, doctorVerify } from '../check-fix.ts';
-import { pricingSetArgv } from '../../../core/budget/no-pricing.ts';
 
 // --- v0.36.1.0 calibration doctor checks (T12) ---
 
@@ -669,16 +668,10 @@ export async function checkRerankerHealth(engine: BrainEngine, now: Date = new D
       return {
         name: 'reranker_health',
         status: 'warn',
-        message: `${budgetFails.length} reranker budget/pricing failure(s) in last 7 days: ${model} has no registered price, so capped searches skip reranking. Register its per-token rate (look it up on the provider's pricing page) or drop --max-cost.`,
-        fix: {
-          argv: pricingSetArgv(model, 'rerank'), consent: [], actor: 'agent', requires_exclusive: false,
-          why: `Registers ${model}'s price so spend caps can account for reranking.`,
-          inputs: [
-            { name: 'usd-per-1M-tokens', how: `Look up ${model}'s price per 1M tokens on the provider's pricing page (for example by web search).` },
-            { name: 'pricing-page-url', how: 'The URL you read the price from.' },
-          ],
-          verify: doctorVerify('reranker_health'),
-        },
+        // A budget audit row can mean missing pricing, cost exhaustion or
+        // concurrency exhaustion. It does not establish the current price.
+        message: `${budgetFails.length} reranker budget/pricing failure(s) recorded in the last 7 days for ${model}. This is audit-log history; no live probe was run. Check the recorded failure reason and current pricing and budget configuration before changing anything. Keep spend caps in place.`,
+        details: { live_probe_performed: false, failures_recorded: budgetFails.length, window_days: 7 },
       };
     }
 

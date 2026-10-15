@@ -218,3 +218,19 @@ describe('reranker_health (v0.48.2 readiness-aware)', () => {
     });
   });
 });
+
+for (const reason of ['no pricing entry at the time', 'cost cap exhausted with a registered price']) {
+  test(`budget audit is history, not a current missing-price diagnosis: ${reason}`, async () => {
+    await inFreshAudit({ GBRAIN_HOME: emptyHome() }, async () => {
+      gw({ VOYAGE_API_KEY: 'pa-test' });
+      logRerankFailure({ model: DEFAULT_RERANKER_MODEL, reason: 'budget', query_hash: 'historical-budget', doc_count: 3, error_summary: reason });
+      const check = await checkRerankerHealth(engineWith({}));
+      expect(check.status).toBe('warn');
+      expect(check.message).toContain('recorded');
+      expect(check.message).not.toContain('has no registered price');
+      expect(check.message).not.toContain('drop --max-cost');
+      expect(check.fix).toBeUndefined();
+      expect(check.details).toMatchObject({ live_probe_performed: false, failures_recorded: 1, window_days: 7 });
+    });
+  });
+}
