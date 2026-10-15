@@ -9,13 +9,16 @@
  * helpers, and the PURE policy functions from skillpack/nag-state.ts only.
  * Compute lives in backup/coverage.ts (engine-side).
  *
- * Two machine-owned files under the gbrain home (atomic tmp+rename, 0600,
+ * Machine-owned files under the gbrain home (atomic tmp+rename, 0600,
  * fail-open on corrupt — a broken state file must never break a session):
  *
  *   backup-status.json    the cached BackupStatus verdict. Written ONLY by a
  *                         successful probed compute (coverage.ts); deleted by
  *                         invalidateBackupStatus() on fix paths (bootstrap
  *                         repo / sources harden / sources push success).
+ *   backup-status.json.generation invalidation token, retained across cache removal.
+ *   backup-status.json.remote-claims attempted identity fingerprints for one remote cycle.
+ *   backup-status.json.lock native coordinator lock, never unlinked by invalidation.
  *   backup-nag-state.json bounded-nag state. OWN schema (gbrain-backup-nag-v1)
  *                         — NOT skillpack's: loadNagState() reconstructs only
  *                         {schema_version, entries} on load, so the dampener /
@@ -38,6 +41,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import { gbrainPath, loadConfigFileOnly } from '../config.ts';
 import {
@@ -75,6 +79,8 @@ export interface BackupAssetVerdict {
     /** Why an `unavailable` probe failed: the full two-second slot ran out, or git exited with an error. */
     cause?: 'timeout' | 'exit';
     checked_at?: string;
+    /** A claimed probe with no durable answer remains unverified until the next cycle. */
+    attempted_at?: string;
     local_commit?: string;
     remote_commit?: string;
     repository_fingerprint?: string;
@@ -110,6 +116,8 @@ export interface BackupStatus {
    */
   degraded?: boolean;
   remote_check_at?: string;
+  /** Binds persisted evidence to fix-path invalidation, including in-flight computes. */
+  cache_generation?: string;
   recovery_scope?: string;
   /**
    * E7: how much the brain holds and since when, measured with the verdict.
@@ -204,6 +212,7 @@ export function currentBackupEvidence(s: BackupStatus, now = Date.now()): Backup
 // ── Paths (test seams follow the nag-state.ts idiom) ────────────────────────
 
 let statusPathOverride: string | null = null;
+let invalidationFailed = false;
 let nagStatePathOverride: string | null = null;
 let intervalOverrideMs: number | null = null;
 
@@ -212,6 +221,7 @@ export function backupStatusPath(): string {
 }
 export function __setBackupStatusPathForTests(p: string | null): void {
   statusPathOverride = p;
+  invalidationFailed = false;
 }
 
 export function backupNagStatePath(): string {
@@ -315,14 +325,63 @@ export function loadBackupStatus(): BackupStatus | null {
     ) {
       return null;
     }
+    if ((raw.cache_generation ?? '') !== backupGeneration()) return null;
     return raw as BackupStatus;
   } catch {
     return null;
   }
 }
 
-export function saveBackupStatus(s: BackupStatus): void {
-  atomicWriteJson(backupStatusPath(), s);
+/** Missing is the legacy generation; unreadable/corrupt is NOT a valid generation. */
+export function backupGeneration(): string {
+  if (invalidationFailed) throw new Error('Backup invalidation failed; cached evidence must not be used');
+  const path = `${backupStatusPath()}.generation`;
+  try {
+    const value = JSON.parse(readFileSync(path, 'utf8'));
+    if (typeof value !== 'string' || !value) throw new Error('Invalid backup generation');
+    return value;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
+export function saveBackupStatus(s: BackupStatus, generation = backupGeneration()): void {
+  if (generation !== backupGeneration()) throw new Error('Backup evidence invalidated during compute');
+  const persisted = { ...s };
+  if (generation) persisted.cache_generation = generation;
+  else delete persisted.cache_generation;
+  atomicWriteJson(backupStatusPath(), persisted);
+  // An invalidation between the check and rename is safe: readers compare the
+  // embedded generation, rather than trusting that the final rename won.
+}
+
+interface RemoteProbeClaims {
+  generation: string;
+  started_at: string;
+  keys: string[];
+}
+
+/** Call only while holding the host backup native lock. No result is invented. */
+export function claimBackupRemoteProbe(key: string, now: Date, generation: string, reset = false): boolean {
+  if (generation !== backupGeneration()) throw new Error('Backup probe invalidated');
+  const path = `${backupStatusPath()}.remote-claims`;
+  let claims: RemoteProbeClaims = { generation, started_at: now.toISOString(), keys: [] };
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as RemoteProbeClaims;
+    if (!raw || typeof raw.generation !== 'string' || typeof raw.started_at !== 'string'
+      || !Array.isArray(raw.keys) || !raw.keys.every(k => typeof k === 'string')) throw new Error('Invalid backup probe claims');
+    const age = now.getTime() - Date.parse(raw.started_at);
+    if (!Number.isFinite(age)) throw new Error('Invalid backup probe claim timestamp');
+    if (!reset && raw.generation === generation && age >= 0 && age <= BACKUP_VERIFICATION_MAX_AGE_MS) claims = raw;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (claims.keys.includes(key)) return false;
+  claims.keys.push(key);
+  atomicWriteJson(path, claims);
+  if (generation !== backupGeneration()) throw new Error('Backup probe invalidated');
+  return true;
 }
 
 /**
@@ -331,9 +390,19 @@ export function saveBackupStatus(s: BackupStatus): void {
  * at the next 30-day recompute. Best-effort — never throws.
  */
 export function invalidateBackupStatus(): void {
+  // A never-used backup cache is a no-op, including when its home does not exist.
+  // A lock file may belong to an in-flight compute; retaining it is conservative.
+  const path = backupStatusPath();
+  if (![path, `${path}.remote-claims`, `${path}.lock`].some(existsSync)) return;
   try {
+    atomicWriteJson(`${backupStatusPath()}.generation`, randomUUID());
+    invalidationFailed = false;
     rmSync(backupStatusPath(), { force: true });
-  } catch {}
+  } catch {
+    invalidationFailed = true;
+    try { rmSync(backupStatusPath(), { force: true }); } catch {}
+    process.stderr.write('[backup] could not persist cache invalidation; this process will not reuse cached evidence. Other running processes may retain stale evidence until storage is repaired.\n');
+  }
 }
 
 /**

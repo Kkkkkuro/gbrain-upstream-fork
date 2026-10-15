@@ -12,7 +12,12 @@ export const BACKUP_REMOTE_PROBE_CAP = 8;
 export const BACKUP_REMOTE_BUDGET_MS = 8_000;
 export const BACKUP_REMOTE_TIMEOUT_MS = 2_000;
 
-export interface RemoteProbeBudget { remaining: number; deadline?: number }
+export interface RemoteProbeBudget {
+  remaining: number;
+  deadline?: number;
+  /** Persist a claim for this exact repository observation before any network I/O. */
+  claim?: (key: string) => boolean;
+}
 
 /**
  * A remote probe starts only when its full `BACKUP_REMOTE_TIMEOUT_MS` slot is
@@ -110,7 +115,7 @@ export async function assessBackupRepository(
     if (!budget) {
       const prior = previous?.verification;
       const age = now.getTime() - Date.parse(prior?.checked_at ?? '');
-      if (previous?.id === id && previous.kind === kind && prior?.repository_fingerprint === fingerprint && Number.isFinite(age) && age >= 0) {
+      if (previous?.id === id && previous.kind === kind && prior?.repository_fingerprint === fingerprint && ((Number.isFinite(age) && age >= 0) || prior.state === 'budget_exhausted' || prior.attempted_at !== undefined)) {
         asset.verification = { ...prior };
         if (prior.state === 'verified') {
           if (previous.state === 'ok' && !dirty && age <= BACKUP_VERIFICATION_MAX_AGE_MS && prior.local_commit === head && prior.remote_commit === head) {
@@ -129,6 +134,15 @@ export async function assessBackupRepository(
     budget.deadline ??= Date.now() + BACKUP_REMOTE_BUDGET_MS;
     if (!budgetAllowsProbe(budget)) {
       asset.verification = { state: 'budget_exhausted', repository_fingerprint: fingerprint };
+      return asset;
+    }
+    if (budget.claim && !budget.claim(JSON.stringify([kind, id, fingerprint]))) {
+      asset.verification = { state: 'not_checked', repository_fingerprint: fingerprint, attempted_at: now.toISOString() };
+      return asset;
+    }
+    // Claim I/O also consumes the wall-clock budget. Never shorten a slot.
+    if (!budgetAllowsProbe(budget)) {
+      asset.verification = { state: 'not_checked', repository_fingerprint: fingerprint, attempted_at: now.toISOString() };
       return asset;
     }
     budget.remaining--;

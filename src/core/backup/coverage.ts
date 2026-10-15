@@ -28,6 +28,9 @@ import { resolveGbrainHome } from '../gbrain-home.ts';
 import { loadBridgeState } from '../skillpack/bridge-state.ts';
 import { loadStorageConfig } from '../storage-config.ts';
 import {
+  backupStatusPath,
+  backupGeneration,
+  claimBackupRemoteProbe,
   BACKUP_INTERVAL_DAYS_DEFAULT,
   BACKUP_STATUS_SCHEMA_VERSION,
   backupCheckDisabled,
@@ -45,6 +48,7 @@ import {
   type BackupComputedBy,
   type BackupStatus,
 } from './status-file.ts';
+import { tryAcquireNativeLock } from '../persistence/native-lock.ts';
 import { assessBackupRepository, BACKUP_REMOTE_PROBE_CAP, budgetAllowsProbe, type RemoteProbeBudget } from './repository.ts';
 
 /** No silent caps: at most this many deduped git roots are probed per run;
@@ -60,6 +64,9 @@ export interface BackupCoverageOpts {
   localGitProbes: boolean;
   verifyRemoteRefs?: boolean;
   previousStatus?: BackupStatus;
+  /** Internal host coordinator: never supplied by remote callers. */
+  continueRemoteSweep?: boolean;
+  claimRemoteProbe?: (key: string) => boolean;
   /** Provenance stamp for the status file (default 'cli'). */
   computedBy?: BackupComputedBy;
 }
@@ -142,7 +149,7 @@ export async function computeBackupCoverage(
   const now = opts.now ?? new Date();
   const assets: BackupAssetVerdict[] = [];
   const remoteBudget: RemoteProbeBudget | undefined = opts.localGitProbes === true && opts.verifyRemoteRefs === true
-    ? { remaining: BACKUP_REMOTE_PROBE_CAP } : undefined;
+    ? { remaining: BACKUP_REMOTE_PROBE_CAP, claim: opts.claimRemoteProbe } : undefined;
   const previousAge = now.getTime() - Date.parse(opts.previousStatus?.checked_at ?? '');
   const previous = opts.localGitProbes === true && opts.previousStatus && !opts.previousStatus.degraded
     && Number.isFinite(previousAge) && previousAge >= 0 && !isBackupStatusStale(opts.previousStatus, now.getTime())
@@ -324,6 +331,12 @@ export async function computeBackupCoverage(
     });
     for (const { root, index } of ordered) {
       const asset = assets[index];
+      if (opts.continueRemoteSweep) {
+        const age = now.getTime() - Date.parse(asset.verification?.checked_at ?? asset.verification?.attempted_at ?? '');
+        if (Number.isFinite(age) && age >= 0 && age <= BACKUP_VERIFICATION_MAX_AGE_MS
+          && (['verified', 'unavailable', 'missing_ref', 'mismatch'].includes(asset.verification?.state ?? '')
+            || asset.verification?.attempted_at !== undefined)) continue;
+      }
       if (!budgetAllowsProbe(remoteBudget)) {
         if (asset.verification?.state !== 'verified') {
           asset.verification = { ...asset.verification, state: 'budget_exhausted' };
@@ -405,7 +418,8 @@ export async function computeBackupCoverage(
     totals,
     assets,
     ...(degraded ? { degraded: true } : {}),
-    ...(remoteBudget ? { remote_check_at: now.toISOString() } : {}),
+    ...(remoteBudget ? { remote_check_at: opts.continueRemoteSweep ? previous?.remote_check_at ?? now.toISOString() : now.toISOString() }
+      : previous?.remote_check_at ? { remote_check_at: previous.remote_check_at } : {}),
     recovery_scope: BACKUP_RECOVERY_SCOPE,
     ...(maturity ? { maturity } : {}),
   }, now.getTime());
@@ -452,33 +466,68 @@ export async function getBackupStatus(
   opts: BackupCoverageOpts & { forceRefresh?: boolean },
 ): Promise<BackupStatus> {
   const hostBrain = operatingOnHostBrain();
-  const cached = hostBrain ? loadBackupStatus() : null;
-  const nowMs = (opts.now ?? new Date()).getTime();
-  const remoteAge = nowMs - Date.parse(cached?.remote_check_at ?? '');
-  const remoteDue = opts.localGitProbes === true && opts.verifyRemoteRefs === true
-    && (!Number.isFinite(remoteAge) || remoteAge < 0 || remoteAge > BACKUP_VERIFICATION_MAX_AGE_MS
-      || (remoteAge >= BACKUP_CONTINUATION_THROTTLE_MS && hasPendingRepoEvidence(cached, nowMs)));
-  if (!opts.forceRefresh && cached && !isBackupStatusStale(cached, nowMs) && !remoteDue) return currentBackupEvidence(cached, nowMs);
-  try {
-    const fresh = await computeBackupCoverage(engine, { ...opts, previousStatus: cached ?? undefined });
-    if (fresh.degraded && cached) return currentBackupEvidence({ ...cached, degraded: true }, nowMs);
-    if (opts.localGitProbes && !fresh.degraded && hostBrain) {
-      // The save gets its own guard: a failed WRITE (disk full) must not
-      // discard the fresh verdict the caller just probed for.
-      try {
-        saveBackupStatus(fresh);
-      } catch {
-        process.stderr.write('[backup] could not persist the verdict cache (continuing with the fresh result)\n');
-      }
-      process.stderr.write(
-        `[backup] checked ${fresh.totals.assets} asset(s): ${fresh.totals.no_remote} without a git remote (computed_by=${fresh.computed_by})\n`,
-      );
-    }
-    return fresh;
-  } catch (err) {
-    if (cached) return currentBackupEvidence({ ...cached, degraded: true }, nowMs);
-    throw err;
+  if (!hostBrain || !opts.localGitProbes) {
+    const cached = hostBrain ? loadBackupStatus() : null;
+    if (cached && !opts.forceRefresh && !isBackupStatusStale(cached, (opts.now ?? new Date()).getTime())) return currentBackupEvidence(cached, (opts.now ?? new Date()).getTime());
+    // Mounted explicit probes keep their existing behavior, but never use host coordination.
+    return computeBackupCoverage(engine, opts);
   }
+  const lock = await tryAcquireNativeLock(`${backupStatusPath()}.lock`);
+  if (!lock) {
+    const cached = loadBackupStatus();
+    if (cached) return currentBackupEvidence({ ...cached, degraded: true }, (opts.now ?? new Date()).getTime());
+    return { ...await computeBackupCoverage(engine, { ...opts, verifyRemoteRefs: false }), degraded: true };
+  }
+  try {
+    const generation = backupGeneration();
+    const cached = loadBackupStatus();
+    const nowMs = (opts.now ?? new Date()).getTime();
+    const remoteAge = nowMs - Date.parse(cached?.remote_check_at ?? '');
+    const remoteDue = opts.localGitProbes === true && opts.verifyRemoteRefs === true
+      && (!Number.isFinite(remoteAge) || remoteAge < 0 || remoteAge > BACKUP_VERIFICATION_MAX_AGE_MS);
+    const pending = hasPendingRepoEvidence(cached, nowMs);
+    const cacheAge = nowMs - Date.parse(cached?.checked_at ?? '');
+    const continuation = opts.verifyRemoteRefs === true && !remoteDue && pending
+      && !!cached && !cached.degraded && !isBackupStatusStale(cached, nowMs)
+      && cacheAge >= 0 && (opts.forceRefresh === true || remoteAge >= BACKUP_CONTINUATION_THROTTLE_MS);
+    if (!opts.forceRefresh && cached && !isBackupStatusStale(cached, nowMs) && !remoteDue && !continuation) return currentBackupEvidence(cached, nowMs);
+    try {
+      let coordinationFailed = false;
+      let resetClaims = opts.forceRefresh === true && cached !== null && !continuation;
+      const fresh = await computeBackupCoverage(engine, { ...opts, now: new Date(nowMs), previousStatus: cached ?? undefined, continueRemoteSweep: continuation,
+        claimRemoteProbe: opts.verifyRemoteRefs !== true ? undefined : (key) => {
+          try {
+            if (coordinationFailed) throw new Error('Backup coordination already failed');
+            const claimed = claimBackupRemoteProbe(key, opts.now ?? new Date(), generation, resetClaims);
+            resetClaims = false;
+            return claimed;
+          } catch (error) { coordinationFailed = true; throw error; }
+        },
+      });
+      if (coordinationFailed || backupGeneration() !== generation) fresh.degraded = true;
+      if (fresh.degraded && cached) return currentBackupEvidence({ ...cached, degraded: true }, nowMs);
+      if (opts.localGitProbes && !fresh.degraded && hostBrain) {
+        // The save gets its own guard: a failed WRITE (disk full) must not
+        // discard the fresh verdict the caller just probed for.
+        try {
+          saveBackupStatus(fresh, generation);
+        } catch {
+          // Invalidated evidence is different from a disk-full cache write:
+          // the former must not escape as a live verified/OK verdict.
+          try { if (backupGeneration() !== generation) fresh.degraded = true; }
+          catch { fresh.degraded = true; }
+          process.stderr.write('[backup] could not persist the verdict cache (continuing with the current evidence)\n');
+        }
+        process.stderr.write(
+          `[backup] checked ${fresh.totals.assets} asset(s): ${fresh.totals.no_remote} without a git remote (computed_by=${fresh.computed_by})\n`,
+        );
+      }
+      return currentBackupEvidence(fresh, nowMs);
+    } catch (err) {
+      if (cached) return currentBackupEvidence({ ...cached, degraded: true }, nowMs);
+      throw err;
+    }
+  } finally { await lock.release(); }
 }
 
 // ── Serve-side in-process refresher (stdio transport ONLY) ──────────────────

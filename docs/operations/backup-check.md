@@ -176,7 +176,20 @@ cache, and forces `backup status` to exit 0. `GBRAIN_HOOKS=0` already silences t
 - `backup-nag-state.json` — the bounded-nag ledger (per-channel counts, the
   24h dampener, the monthly global cap, the spawn debounce).
 
-Both are fail-open: corrupt or missing files never break a session.
+The verdict cache and nag ledger treat missing or corrupt files as absent.
+Verification also owns these coordination files:
+
+- `backup-status.json.generation` — invalidation identity, retained when the
+  verdict cache is removed. A missing file is the legacy generation; unreadable
+  or malformed content is not a valid generation and prevents evidence reuse.
+- `backup-status.json.remote-claims` — attempted remote identity fingerprints
+  for the current bounded verification cycle. Unreadable or malformed claims
+  refuse another probe rather than treating previous attempts as absent.
+- `backup-status.json.lock` — native host coordinator lock. Invalidation never
+  unlinks it; concurrent verification cannot bypass the same probe budget.
+
+Coordination failure prevents verified coverage; depending on cached evidence
+it returns a partial/degraded verdict or an explicit error. Do not delete these files to reset probe accounting.
 
 ## Privacy
 

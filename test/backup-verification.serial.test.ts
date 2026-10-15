@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import * as childProcess from 'node:child_process';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { computeBackupCoverage, getBackupStatus } from '../src/core/backup/coverage.ts';
-import { __setBackupStatusPathForTests, loadBackupStatus, saveBackupStatus } from '../src/core/backup/status-file.ts';
+import { __setBackupStatusPathForTests, loadBackupStatus, saveBackupStatus, invalidateBackupStatus } from '../src/core/backup/status-file.ts';
+import * as backupStatusModule from '../src/core/backup/status-file.ts';
 import { checkBackupCoverage } from '../src/commands/doctor/checks/backup-coverage.ts';
 import { pushStatusPathForRoot } from '../src/core/workspace-push.ts';
 import { assessBackupRepository, BACKUP_REMOTE_PROBE_CAP, BACKUP_REMOTE_BUDGET_MS, BACKUP_REMOTE_TIMEOUT_MS } from '../src/core/backup/repository.ts';
@@ -19,7 +20,7 @@ const now = new Date('2026-09-22T12:00:00Z');
 const verified = { localGitProbes: true, verifyRemoteRefs: true, now };
 
 beforeEach(() => {
-  tmp = mkdtempSync(join(tmpdir(), 'gbrain-backup-evidence-'));
+  tmp = realpathSync(mkdtempSync(join(tmpdir(), 'gbrain-backup-evidence-')));
   oldHome = process.env.GBRAIN_HOME;
   process.env.GBRAIN_HOME = tmp;
   __setBackupStatusPathForTests(join(tmp, 'status.json'));
@@ -160,12 +161,19 @@ test('remote-ref readback is capped, cached, and never performed for untrusted o
     expect(commands.every(args => args.includes('ls-remote') && !args.includes('push') && !args.includes('fetch'))).toBe(true);
     expect(result.assets.filter(a => a.verification?.state === 'budget_exhausted')).toHaveLength(2);
     expect(result.overall).toBe('warn');
+    // Official249 throttles ordinary continuation for60s; forced checks retain claims.
     await getBackupStatus(engine(roots), verified);
     expect(commands).toHaveLength(BACKUP_REMOTE_PROBE_CAP);
+    const followup = { ...verified, now: new Date(now.getTime() + 60_000) };
+    const continued = await getBackupStatus(engine(roots), followup);
+    expect(commands).toHaveLength(BACKUP_REMOTE_PROBE_CAP + 2);
+    expect(continued.totals.recoverable_repos).toBe(10);
+    await getBackupStatus(engine(roots), followup);
+    expect(commands).toHaveLength(BACKUP_REMOTE_PROBE_CAP + 2);
     await computeBackupCoverage(engine(roots), { ...verified, localGitProbes: false });
     await computeBackupCoverage(engine(roots), { localGitProbes: true, now, computedBy: 'serve' });
     await checkBackupCoverage(engine(roots), { now });
-    expect(commands).toHaveLength(BACKUP_REMOTE_PROBE_CAP);
+    expect(commands).toHaveLength(BACKUP_REMOTE_PROBE_CAP + 2);
   } finally { probe.mockRestore(); }
 });
 
@@ -237,11 +245,11 @@ test('successive bounded checks prioritize pending roots and retain identity-bou
     expect(first.totals.recoverable_repos).toBe(BACKUP_REMOTE_PROBE_CAP);
     commands.length = 0;
     const second = await getBackupStatus(engine(roots), { ...verified, forceRefresh: true, now: new Date(now.getTime() + 1000) });
-    expect(commands).toHaveLength(BACKUP_REMOTE_PROBE_CAP);
+    expect(commands).toHaveLength(2);
     expect(commands.slice(0, 2).map(args => args[1])).toEqual(roots.slice(-2));
     expect(second.totals.recoverable_repos).toBe(roots.length);
     expect(second.overall).toBe('ok');
-    expect(second.assets.filter(a => a.verification?.checked_at === now.toISOString())).toHaveLength(2);
+    expect(second.assets.filter(a => a.verification?.checked_at === now.toISOString())).toHaveLength(8);
     for (const change of [
       { degraded: true },
       { checked_at: new Date(now.getTime() + 60_000).toISOString() },
@@ -420,4 +428,238 @@ test('a local git probe that times out keeps an established bad verdict and neve
   try {
     expect(await assessBackupRepository(root, 'source_repo', 'source-id', now)).toMatchObject({ state: 'unknown', detail: 'probe_failed' });
   } finally { slow.mockRestore(); }
+});
+
+
+// Continuation coordination uses synthetic/local fixtures only; no provider or remote service.
+function stubSuccessfulRemote(onCall?: (root: string) => void): ExecFileStub {
+  return (_file, args, _opts, callback) => {
+    const root = args[args.indexOf('-C') + 1];
+    onCall?.(root);
+    queueMicrotask(() => callback(null, `${git(root, 'rev-parse', 'HEAD')}\t${args.at(-1)}\n`));
+    return {};
+  };
+}
+
+test('continuation retains real failures and never retries them to fill the next batch', async () => {
+  const roots = await Promise.all(Array.from({ length: 10 }, async (_, i) => (await repository(`failure-${i}`)).root));
+  const calls: string[] = [];
+  const good = stubSuccessfulRemote();
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(((_f: string, args: string[], opts: { timeout: number }, cb: (error: Error | null, stdout: string) => void) => {
+    const root = args[args.indexOf('-C') + 1]; calls.push(root);
+    if (root === roots[0]) { queueMicrotask(() => cb(Object.assign(new Error('offline fixture'), { code: 128 }), '')); return {}; }
+    return good(_f, args, opts, cb);
+  }) as typeof childProcess.execFile);
+  try {
+    await getBackupStatus(engine(roots), verified);
+    const second = await getBackupStatus(engine(roots), { ...verified, forceRefresh: true });
+    expect(calls).toHaveLength(10);
+    expect(new Set(calls).size).toBe(10);
+    expect(second.assets[0].verification?.state).toBe('unavailable');
+    expect(second.totals.recoverable_repos).toBe(9);
+    expect(second.overall).toBe('warn');
+  } finally { probe.mockRestore(); }
+}, 15_000);
+
+test('eight concurrent callers share a native lock and cannot duplicate remote claims', async () => {
+  const roots = await Promise.all(Array.from({ length: 10 }, async (_, i) => (await repository(`parallel-${i}`)).root));
+  let entered!: () => void; const firstEntered = new Promise<void>(r => { entered = r; });
+  let release!: () => void; const gate = new Promise<void>(r => { release = r; });
+  const calls: string[] = [];
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(((_f: string, args: string[], _opts: { timeout: number }, cb: (error: Error | null, stdout: string) => void) => {
+    const root = args[args.indexOf('-C') + 1]; calls.push(root); entered();
+    void gate.then(() => cb(null, `${git(root, 'rev-parse', 'HEAD')}\t${args.at(-1)}\n`)); return {};
+  }) as typeof childProcess.execFile);
+  try {
+    const first = getBackupStatus(engine(roots), verified);
+    await firstEntered;
+    const others = await Promise.all(Array.from({ length: 7 }, () => getBackupStatus(engine(roots), verified)));
+    expect(others.every(s => s.degraded)).toBe(true);
+    release(); await first;
+    expect(calls.length).toBeLessThanOrEqual(8);
+    expect(new Set(calls).size).toBe(calls.length);
+    await getBackupStatus(engine(roots), { ...verified, now: new Date(now.getTime() + 60_000) });
+    expect(calls).toHaveLength(10);
+    expect(new Set(calls).size).toBe(10);
+  } finally { release(); probe.mockRestore(); }
+}, 20_000);
+
+test('invalidation during a probe cannot resurrect the old cache generation', async () => {
+  const { root } = await repository();
+  const old = backupStatusModule.backupGeneration();
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(stubSuccessfulRemote(() => invalidateBackupStatus()) as typeof childProcess.execFile);
+  try {
+    const result = await getBackupStatus(engine([root]), verified);
+    expect(result.degraded).toBe(true);
+    expect(loadBackupStatus()).toBeNull();
+    expect(backupStatusModule.backupGeneration()).not.toBe(old);
+    expect(() => saveBackupStatus(result, old)).toThrow('invalidated');
+  } finally { probe.mockRestore(); }
+});
+
+test('a claim with no saved response is not replayed after a crash; TTL permits a new cycle', async () => {
+  const { root } = await repository();
+  const local = await assessBackupRepository(root, 'source_repo', 'fixture-0', now);
+  const key = JSON.stringify(['source_repo', 'fixture-0', local.verification?.repository_fingerprint]);
+  expect(backupStatusModule.claimBackupRemoteProbe(key, now, backupStatusModule.backupGeneration())).toBe(true);
+  let calls = 0;
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(stubSuccessfulRemote(() => calls++) as typeof childProcess.execFile);
+  try {
+    const result = await getBackupStatus(engine([root]), verified);
+    expect(calls).toBe(0);
+    expect(result.assets[0].verification?.state).toBe('not_checked');
+    expect(result.assets[0].verification?.attempted_at).toBe(now.toISOString());
+    expect(result.totals.recoverable_repos).toBe(0);
+    await getBackupStatus(engine([root]), { ...verified, now: new Date(now.getTime() + 3_600_001) });
+    expect(calls).toBe(1);
+  } finally { probe.mockRestore(); }
+});
+
+test('claim persistence failure starts no remote work and cannot replace cached evidence', async () => {
+  const { root } = await repository();
+  mkdirSync(join(tmp, 'status.json.remote-claims'));
+  let calls = 0;
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(stubSuccessfulRemote(() => calls++) as typeof childProcess.execFile);
+  try {
+    const result = await getBackupStatus(engine([root]), verified);
+    expect(calls).toBe(0);
+    expect(result.degraded).toBe(true);
+    expect(loadBackupStatus()).toBeNull();
+  } finally { probe.mockRestore(); }
+});
+
+test('changed fingerprints invalidate a prior claim without retrying an unchanged fingerprint', async () => {
+  const { root } = await repository();
+  const local = await assessBackupRepository(root, 'source_repo', 'fixture-0', now);
+  expect(backupStatusModule.claimBackupRemoteProbe(JSON.stringify(['source_repo', 'fixture-0', local.verification?.repository_fingerprint]), now, backupStatusModule.backupGeneration())).toBe(true);
+  git(root, 'commit', '--allow-empty', '-m', 'changed synthetic head');
+  let calls = 0;
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(stubSuccessfulRemote(() => calls++) as typeof childProcess.execFile);
+  try {
+    const result = await getBackupStatus(engine([root]), verified);
+    expect(calls).toBe(1);
+    expect(result.assets[0].verification?.state).toBe('verified');
+    await getBackupStatus(engine([root]), verified);
+    expect(calls).toBe(1);
+  } finally { probe.mockRestore(); }
+});
+
+
+test('failed invalidation is observable and the current process fails closed', async () => {
+  const { root } = await repository();
+  await getBackupStatus(engine([root]), verified);
+  mkdirSync(join(tmp, 'status.json.generation'));
+  const messages: string[] = [];
+  const log = spyOn(process.stderr, 'write').mockImplementation(((message: string) => { messages.push(String(message)); return true; }) as typeof process.stderr.write);
+  try {
+    invalidateBackupStatus();
+    expect(messages.join('')).toContain('could not persist cache invalidation');
+    expect(loadBackupStatus()).toBeNull();
+    expect(() => backupStatusModule.backupGeneration()).toThrow('invalidation failed');
+    await expect(getBackupStatus(engine([root]), verified)).rejects.toThrow('invalidation failed');
+  } finally { log.mockRestore(); }
+});
+
+
+test('corrupt invalidation generation fails closed before any network probe', async () => {
+  const { root } = await repository();
+  writeFileSync(join(tmp, 'status.json.generation'), 'not JSON');
+  let calls = 0;
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(stubSuccessfulRemote(() => calls++) as typeof childProcess.execFile);
+  try {
+    await expect(getBackupStatus(engine([root]), verified)).rejects.toThrow();
+    expect(calls).toBe(0);
+    expect(loadBackupStatus()).toBeNull();
+  } finally { probe.mockRestore(); }
+});
+
+test('mounted explicit verification retains its behavior without touching host cache or claims', async () => {
+  const { root } = await repository();
+  await getBackupStatus(engine([root]), verified);
+  const cached = readFileSync(join(tmp, 'status.json'), 'utf8');
+  const claims = readFileSync(join(tmp, 'status.json.remote-claims'), 'utf8');
+  let calls = 0;
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(stubSuccessfulRemote(() => calls++) as typeof childProcess.execFile);
+  try {
+    await withEnv({ GBRAIN_BRAIN_ID: 'fixture-mounted-brain' }, async () => {
+      const result = await getBackupStatus(engine([root]), verified);
+      expect(result.totals.recoverable_repos).toBe(1);
+    });
+    expect(calls).toBe(1);
+    expect(readFileSync(join(tmp, 'status.json'), 'utf8')).toBe(cached);
+    expect(readFileSync(join(tmp, 'status.json.remote-claims'), 'utf8')).toBe(claims);
+  } finally { probe.mockRestore(); }
+});
+
+
+test('invalidation during a first probe cannot return an ok verdict without an older cache', async () => {
+  const { root } = await repository();
+  const head = git(root, 'rev-parse', 'HEAD');
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(((...args: any[]) => {
+    invalidateBackupStatus();
+    const callback = args[args.length - 1];
+    callback(null, head + '\trefs/heads/main\n', '');
+    return { kill() {} } as any;
+  }) as any);
+  try {
+    const result = await getBackupStatus(engine([root]), verified);
+    expect(result.degraded).toBe(true);
+    expect(result.overall).toBe('warn');
+    expect(result.totals.recoverable_repos).toBe(0);
+    expect(result.assets[0].verification?.state).not.toBe('verified');
+    expect((await checkBackupCoverage(engine([root]), { localOnly: true, now })).status).toBe('warn');
+  } finally { probe.mockRestore(); }
+});
+
+test('generation change immediately before save is not swallowed as an ordinary cache write failure', async () => {
+  const { root } = await repository();
+  const statusModule = await import('../src/core/backup/status-file.ts');
+  const originalSave = statusModule.saveBackupStatus;
+  const save = spyOn(statusModule, 'saveBackupStatus').mockImplementation((s, generation) => {
+    invalidateBackupStatus();
+    originalSave(s, generation);
+  });
+  try {
+    const result = await getBackupStatus(engine([root]), verified);
+    expect(result.degraded).toBe(true);
+    expect(result.overall).toBe('warn');
+    expect(result.totals.recoverable_repos).toBe(0);
+    expect(loadBackupStatus()).toBeNull();
+    expect((await checkBackupCoverage(engine([root]), { localOnly: true, now })).status).toBe('warn');
+  } finally { save.mockRestore(); }
+});
+
+
+test('claim persistence time consumes the full-slot budget and cannot start a shortened remote probe', async () => {
+  const { root } = await repository();
+  let clock = Date.now();
+  const time = spyOn(Date, 'now').mockImplementation(() => clock);
+  let calls = 0;
+  const claims: string[] = [];
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(stubSuccessfulRemote(() => calls++) as typeof childProcess.execFile);
+  const budget = { remaining: 1, deadline: clock + BACKUP_REMOTE_TIMEOUT_MS,
+    claim: (key: string) => { claims.push(key); clock++; return true; } };
+  try {
+    const result = await assessBackupRepository(root, 'source_repo', 'fixture-0', now, budget);
+    expect(claims).toHaveLength(1);
+    expect(JSON.parse(claims[0]).slice(0, 2)).toEqual(['source_repo', 'fixture-0']);
+    expect(calls).toBe(0);
+    expect(budget.remaining).toBe(1);
+    expect(result.verification).toMatchObject({ state: 'not_checked', attempted_at: now.toISOString() });
+    expect(result.verification).not.toHaveProperty('cause');
+  } finally { probe.mockRestore(); time.mockRestore(); }
+});
+
+test('an already claimed identity starts no duplicate remote probe or consumes a probe slot', async () => {
+  const { root } = await repository();
+  let calls = 0, claims = 0;
+  const probe = spyOn(childProcess, 'execFile').mockImplementation(stubSuccessfulRemote(() => calls++) as typeof childProcess.execFile);
+  const budget = { remaining: 1, claim: (_key: string) => { claims++; return false; } };
+  try {
+    const result = await assessBackupRepository(root, 'source_repo', 'fixture-0', now, budget);
+    expect(claims).toBe(1);
+    expect(calls).toBe(0);
+    expect(budget.remaining).toBe(1);
+    expect(result.verification).toMatchObject({ state: 'not_checked', attempted_at: now.toISOString() });
+  } finally { probe.mockRestore(); }
 });
