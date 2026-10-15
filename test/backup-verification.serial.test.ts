@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
-import { computeBackupCoverage, getBackupStatus } from '../src/core/backup/coverage.ts';
+import { computeBackupCoverage, getBackupStatus, maybeRefreshBackupStatusInProcess, __resetBackupRefreshForTests } from '../src/core/backup/coverage.ts';
 import { __setBackupStatusPathForTests, loadBackupStatus, saveBackupStatus, invalidateBackupStatus } from '../src/core/backup/status-file.ts';
 import * as backupStatusModule from '../src/core/backup/status-file.ts';
 import { checkBackupCoverage } from '../src/commands/doctor/checks/backup-coverage.ts';
@@ -13,6 +13,8 @@ import { pushStatusPathForRoot } from '../src/core/workspace-push.ts';
 import { assessBackupRepository, BACKUP_REMOTE_PROBE_CAP, BACKUP_REMOTE_BUDGET_MS, BACKUP_REMOTE_TIMEOUT_MS } from '../src/core/backup/repository.ts';
 import { makeGitFixture } from './helpers/git-fixture.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { tryAcquireNativeLock } from '../src/core/persistence/native-lock.ts';
+import { notifyPgliteOpened } from '../src/core/pglite-lifecycle.ts';
 
 let tmp: string;
 let oldHome: string | undefined;
@@ -662,4 +664,92 @@ test('an already claimed identity starts no duplicate remote probe or consumes a
     expect(budget.remaining).toBe(1);
     expect(result.verification).toMatchObject({ state: 'not_checked', attempted_at: now.toISOString() });
   } finally { probe.mockRestore(); }
+});
+
+
+test.each([false, true])('disconnect drains a live backup lock through settlement (query failure=%s)', async (fail) => {
+  __resetBackupRefreshForTests();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let stop: (() => Promise<void>) | undefined;
+  let calls = 0;
+  const e = { ...engine([]),
+    registerBeforeDisconnect(run: () => Promise<void>) { stop = run; return () => { stop = undefined; }; },
+    async executeRaw(sql: string) {
+      calls++; entered.resolve(); await release.promise;
+      if (fail) throw new Error('synthetic backup query failure');
+      return sql.includes('FROM pages') ? [{ n: 0 }] : [];
+    },
+  } as unknown as BrainEngine;
+  const lockPath = join(tmp, 'status.json.lock');
+  let shutdown: Promise<void> | undefined;
+  let closed = false;
+  try {
+    maybeRefreshBackupStatusInProcess(e);
+    await entered.promise;
+    expect(typeof stop).toBe('function');
+    shutdown = stop!().then(() => { closed = true; });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    const held = await tryAcquireNativeLock(lockPath);
+    try { expect(held).toBeNull(); } finally { await held?.release(); }
+    release.resolve();
+    await shutdown;
+    expect(closed).toBe(true);
+    const free = await tryAcquireNativeLock(lockPath);
+    expect(free).not.toBeNull();
+    await free?.release();
+    const before = calls;
+    __resetBackupRefreshForTests();
+    maybeRefreshBackupStatusInProcess(e);
+    await Promise.resolve();
+    expect(calls).toBe(before); // Closing, even after the attempt floor is reset.
+    expect(typeof stop).toBe('function');
+    notifyPgliteOpened(e, undefined);
+    expect(stop).toBeUndefined(); // Successful reopen retires the old stop gate.
+  } finally {
+    release.resolve();
+    await shutdown;
+    // Also settle the original implementation on a red run before fixture cleanup.
+    const until = Date.now() + 2000;
+    while (true) {
+      const lock = await tryAcquireNativeLock(lockPath);
+      if (lock) { await lock.release(); break; }
+      if (Date.now() >= until) throw new Error('backup refresh retained its test lock');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+  }
+});
+
+
+test('an idle refresh lifecycle still fences late dispatch after engine shutdown', async () => {
+  __resetBackupRefreshForTests();
+  const entered = Promise.withResolvers<void>();
+  let stop: (() => Promise<void>) | undefined;
+  let calls = 0;
+  const e = { ...engine([]),
+    registerBeforeDisconnect(run: () => Promise<void>) { stop = run; return () => { stop = undefined; }; },
+    async executeRaw(sql: string) { calls++; entered.resolve(); return sql.includes('FROM pages') ? [{ n: 0 }] : []; },
+  } as unknown as BrainEngine;
+  maybeRefreshBackupStatusInProcess(e);
+  await entered.promise;
+  // Allow the real refresh to settle naturally before invoking the engine stop gate.
+  const until = Date.now() + 2000;
+  while (!loadBackupStatus()) {
+    if (Date.now() >= until) throw new Error('backup refresh did not settle');
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  const lock = await tryAcquireNativeLock(join(tmp, 'status.json.lock'));
+  expect(lock).not.toBeNull();
+  await lock?.release();
+  expect(typeof stop).toBe('function');
+  await stop!();
+  const before = calls;
+  __resetBackupRefreshForTests();
+  invalidateBackupStatus(); // No fresh cache or attempt floor can mask the closing fence.
+  maybeRefreshBackupStatusInProcess(e);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  expect(calls).toBe(before);
+  notifyPgliteOpened(e, undefined);
+  expect(stop).toBeUndefined();
 });

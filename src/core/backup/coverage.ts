@@ -49,6 +49,7 @@ import {
   type BackupStatus,
 } from './status-file.ts';
 import { tryAcquireNativeLock } from '../persistence/native-lock.ts';
+import { registerPgliteReopen } from '../pglite-lifecycle.ts';
 import { assessBackupRepository, BACKUP_REMOTE_PROBE_CAP, budgetAllowsProbe, type RemoteProbeBudget } from './repository.ts';
 
 /** No silent caps: at most this many deduped git roots are probed per run;
@@ -541,7 +542,45 @@ export async function getBackupStatus(
 // request arguments, runs fixed read-only git subcommands via execFile array
 // args, and only writes a machine-owned file under ~/.gbrain.
 
+interface BackupRefreshWork { closing: boolean; work: Promise<void> }
+const refreshWork = new WeakMap<BrainEngine, BackupRefreshWork>();
 let refreshInFlight = false;
+
+/** Hold datastore shutdown until the refresh has released its native lock. */
+function backupRefreshState(engine: BrainEngine): BackupRefreshWork {
+  const prior = refreshWork.get(engine);
+  if (prior) return prior;
+  const state: BackupRefreshWork = { closing: false, work: Promise.resolve() };
+  let unregisterReopen: (() => void) | undefined;
+  const unregisterStop = engine.registerBeforeDisconnect?.(async () => {
+    state.closing = true;
+    await state.work;
+  });
+  const clear = () => {
+    unregisterStop?.(); unregisterReopen?.();
+    if (refreshWork.get(engine) === state) refreshWork.delete(engine);
+  };
+  // A successful PGLite reopen starts a new lifecycle; finishing close alone
+  // never re-admits refresh work against a datastore that is still closing.
+  if (engine.kind === 'pglite') unregisterReopen = registerPgliteReopen(engine, () => {
+    if (state.closing) clear();
+  });
+  refreshWork.set(engine, state);
+  return state;
+}
+
+function startBackupRefresh(engine: BrainEngine): void {
+  const state = backupRefreshState(engine);
+  refreshInFlight = true;
+  state.work = Promise.resolve()
+    .then(() => getBackupStatus(engine, { localGitProbes: true, computedBy: 'serve', forceRefresh: true }))
+    .then(() => {}, () => {})
+    .finally(() => {
+      refreshInFlight = false;
+      // Keep the stop gate while idle too: a delayed dispatch must not restart
+      // refresh after disconnect has already traversed its lifecycle barriers.
+    });
+}
 let lastRefreshAttemptMs = 0;
 /** Failure/attempt throttle so a broken compute can't retry per dispatch. */
 const REFRESH_ATTEMPT_FLOOR_MS = 60 * 60 * 1000;
@@ -559,7 +598,7 @@ export function __resetBackupRefreshForTests(): void {
  */
 export function maybeRefreshBackupStatusInProcess(engine: BrainEngine): void {
   try {
-    if (refreshInFlight) return;
+    if (refreshInFlight || refreshWork.get(engine)?.closing) return;
     if (backupCheckDisabled()) return;
     const now = Date.now();
     if (now - lastRefreshAttemptMs < REFRESH_ATTEMPT_FLOOR_MS) return;
@@ -573,13 +612,8 @@ export function maybeRefreshBackupStatusInProcess(engine: BrainEngine): void {
       lastRefreshAttemptMs = now;
       return;
     }
-    refreshInFlight = true;
     lastRefreshAttemptMs = now;
-    void getBackupStatus(engine, { localGitProbes: true, computedBy: 'serve', forceRefresh: true })
-      .catch(() => {})
-      .finally(() => {
-        refreshInFlight = false;
-      });
+    startBackupRefresh(engine);
   } catch {
     /* never break dispatch over a refresher */
   }
