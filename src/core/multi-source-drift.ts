@@ -8,8 +8,8 @@
  *
  * Heuristic (codex OV12 — softened from "is misrouted" to "appears misrouted"):
  * a non-default source X is configured with `local_path`, AND the filesystem
- * at `local_path` contains a markdown file whose slug exists at (default,
- * slug) in the DB but is missing from (X, slug). Two possible causes:
+ * at `local_path` contains a sync-admitted markdown file whose slug exists at
+ * (default, slug) in the DB but is missing from (X, slug). Two possible causes:
  *   1. Pre-v0.30.3 putPage misroute (the case this check was designed for).
  *   2. Source X never completed initial sync, and the default page is
  *      unrelated content that happens to share the slug.
@@ -20,6 +20,8 @@
  * Implementation notes:
  *  - FS walk handles `.md` AND `.mdx` (codex OV13: matches `src/core/sync.ts`
  *    which treats both as markdown).
+ *  - Sync's isSyncable predicate excludes metafiles and Markdown outside
+ *    the source's stored strategy before any counterpart is called missing.
  *  - Batched single-query DB lookup (D17): collect all candidate slugs from
  *    the FS walk into one array, then run ONE SELECT against pages with a
  *    VALUES clause. NOT a per-file loop (which would be 20K round trips on
@@ -43,9 +45,10 @@
  */
 
 import { readdirSync, lstatSync, statSync } from 'fs';
-import { join, relative } from 'path';
+import { join, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
-import { pathToSlug, unsyncableReason } from './sync.ts';
+import { isMarkdownFilePath, isPathPruned, pathToSlug, pruneDir, type SyncStrategy } from './sync.ts';
+import { resolveSyncAdmission } from './persistence/sync-admission.ts';
 import { readSlugRootMode } from './sync-anchor.ts';
 import { git } from './sync-git.ts';
 
@@ -94,8 +97,8 @@ function positiveIntEnv(name: string): number | undefined {
 const SAMPLE_LIMIT = 5;
 
 /**
- * Walk a directory tree for `.md` + `.mdx` files. Skips dotfiles (`.git`),
- * `_*.md` files (the existing extract.ts convention), and silently swallows
+ * Walk a directory tree for `.md` + `.mdx` files. Keeps hidden paths available
+ * when sync.include_hidden can admit them, prunes generated trees, and handles
  * read errors on individual entries. Returns relative paths from `root`.
  *
  * Bounded by `limit` (max files) and `deadlineMs` (epoch ms). Returns early
@@ -107,6 +110,7 @@ function walkMarkdownAndMdxFiles(
   root: string,
   limit: number,
   deadlineMs: number,
+  includeHidden: readonly string[],
 ): { files: { relPath: string }[]; truncated: boolean; rootUnreadable: boolean; unreadableDirs: number } {
   const files: { relPath: string }[] = [];
   let truncated = false;
@@ -123,30 +127,29 @@ function walkMarkdownAndMdxFiles(
     }
     for (const entry of entries) {
       if (truncated) return;
-      if (entry.startsWith('.')) continue;
-      // Skip heavy non-content dirs so the walk doesn't exhaust the time
-      // budget on dependency/build trees (node_modules can be 50k+ files
-      // with zero .md). These are never gbrain page sources.
-      if (entry === 'node_modules' || entry === 'dist' || entry === 'build' ||
-          entry === '.next' || entry === 'vendor' || entry === 'target') continue;
+      const relPath = relative(root, join(d, entry)).split(sep).join('/');
+      // Only dot pruning is waivable; raw sidecars and generated/vendor trees
+      // stay excluded even when an include_hidden glob permits the parent.
+      if (isPathPruned(relPath, includeHidden.length ? ['**'] : undefined)) continue;
       const full = join(d, entry);
       let isDir = false;
       try {
-        isDir = lstatSync(full).isDirectory();
+        const stat = lstatSync(full);
+        isDir = stat.isDirectory();
+        if (!isDir && !stat.isFile()) continue;
       } catch {
         continue;
       }
       if (isDir) {
+        if (!entry.startsWith('.') && !pruneDir(entry, d)) continue;
         // Time check on directory descent too, so a deep dependency-free
         // tree still respects the deadline even before any .md is found.
         if (Date.now() >= deadlineMs) { truncated = true; return; }
         walk(full);
         continue;
       }
-      const isMd = entry.endsWith('.md') || entry.endsWith('.mdx');
-      if (!isMd) continue;
-      if (entry.startsWith('_')) continue; // matches extract.ts convention
-      files.push({ relPath: relative(root, full) });
+      if (!isMarkdownFilePath(entry)) continue;
+      files.push({ relPath });
       if (files.length >= limit) {
         truncated = true;
         return;
@@ -210,19 +213,19 @@ async function batchProbeExistence(
 }
 
 /**
- * The path prefix sync put in front of a walked file's `local_path`-relative
- * path before slugging it: '' unless the source is pinned to 'git-root', and
- * then `local_path`'s location in its git work tree as git reports it
- * (`rev-parse --show-prefix`: '' at the toplevel, 'sub/dir/' below it, with
- * symlinks resolved, the scope managed sync derives). null when git cannot
- * place `local_path` in a work tree.
+ * Sync admission uses Git-relative paths even when a source-root pin keeps
+ * slugs local_path-relative. Keep both prefixes: a nested AGENTS.md is content,
+ * not a root scaffold, regardless of the source's slug pin. Unpinned/source-root
+ * paths outside Git retain the legacy local_path-relative check; a git-root
+ * pin whose location cannot be resolved still reports not verified.
  */
-async function syncedPathPrefix(engine: BrainEngine, src: SourceWithPath): Promise<string | null> {
-  if (await readSlugRootMode(engine, src.id) !== 'git-root') return '';
+async function syncedPathPrefixes(engine: BrainEngine, src: SourceWithPath): Promise<{ slug: string; admission: string } | null> {
+  const gitRootSlugs = await readSlugRootMode(engine, src.id) === 'git-root';
   try {
-    return git(src.local_path, ['rev-parse', '--show-prefix'], [], 30_000, { silenceStderr: true });
+    const prefix = git(src.local_path, ['rev-parse', '--show-prefix'], [], 30_000, { silenceStderr: true });
+    return { slug: gitRootSlugs ? prefix : '', admission: prefix };
   } catch {
-    return null;
+    return gitRootSlugs ? null : { slug: '', admission: '' };
   }
 }
 
@@ -256,7 +259,11 @@ export async function findMisroutedPages(
       walkTruncated = true;
       break;
     }
-    const { files, truncated, rootUnreadable, unreadableDirs } = walkMarkdownAndMdxFiles(src.local_path, limit, deadlineMs);
+    const [source] = await engine.executeRaw<{ strategy: SyncStrategy | null }>(
+      `SELECT config->>'strategy' AS strategy FROM sources WHERE id = $1`, [src.id],
+    );
+    const admission = await resolveSyncAdmission(engine, { strategy: source?.strategy ?? 'markdown' });
+    const { files, truncated, rootUnreadable, unreadableDirs } = walkMarkdownAndMdxFiles(src.local_path, limit, deadlineMs, admission.includeHidden);
     if (truncated) walkTruncated = true;
     if (rootUnreadable) unreadable.push({ source_id: src.id, reason: 'root_unreadable', dirs: 1 });
     else if (unreadableDirs > 0) unreadable.push({ source_id: src.id, reason: 'subdirs_unreadable', dirs: unreadableDirs });
@@ -264,20 +271,17 @@ export async function findMisroutedPages(
 
     // Asked only once the walk found files, so a missing local_path stays
     // root_unreadable instead of reading as a git-root skip.
-    const prefix = await syncedPathPrefix(engine, src);
-    if (prefix === null) {
+    const prefixes = await syncedPathPrefixes(engine, src);
+    if (prefixes === null) {
       gitRootSkipped.push(src.id);
       continue;
     }
 
-    // Convert FS paths to canonical slugs (lowercased, extension stripped).
-    // Sync refuses metafiles (root AGENTS.md/CLAUDE.md, README.md, ...), pruned
-    // dirs and malformed names, so they never become pages in this source and
-    // a same-slug page on default is not a misroute (#6681).
+    // A path sync will never import is not an intended counterpart. Reuse
+    // managed discovery's complete admission before applying the slug pin.
     const slugs = Array.from(new Set(files
-      .map(f => prefix + f.relPath)
-      .filter(path => unsyncableReason(path, { strategy: 'markdown' }) === null)
-      .map(path => pathToSlug(path))));
+      .filter(f => admission.eligible(prefixes.admission + f.relPath, f.relPath, prefixes.slug + f.relPath))
+      .map(f => pathToSlug(prefixes.slug + f.relPath))));
     const existenceMap = await batchProbeExistence(engine, slugs, src.id);
 
     for (const slug of slugs) {

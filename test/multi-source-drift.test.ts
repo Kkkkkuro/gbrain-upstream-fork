@@ -29,6 +29,9 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runSources } from '../src/commands/sources.ts';
 import { findMisroutedPages } from '../src/core/multi-source-drift.ts';
 import { writeSlugRootMode } from '../src/core/sync-anchor.ts';
+import { claimWorktree } from '../src/core/persistence/ownership.ts';
+import { discoverManagedSync } from '../src/core/persistence/sync-discovery.ts';
+import { withEnv } from './helpers/with-env.ts';
 import { multiSourceDriftCheck } from '../src/commands/doctor/schema-pack-checks.ts';
 
 let engine: PGLiteEngine;
@@ -358,4 +361,131 @@ describe('multiSourceDriftCheck — skipped git-root sources (#5862)', () => {
     const check = multiSourceDriftCheck({ ...clean, git_root_skipped: [] }, 2, 'local');
     expect(check).toMatchObject({ status: 'ok', message: 'No cross-source slug drift detected.' });
   });
+});
+
+/**
+ * Admission regression (#6681): Doctor must only call an absent counterpart
+ * drift when sync admits its path. The old walker admitted root scaffolds and
+ * Markdown excluded by a code source; existing cases only covered ordinary
+ * Markdown. Real files and PGLite rows exercise the public detector, without a
+ * new production seam. Reverting its admission filter must fail these cases.
+ */
+describe('findMisroutedPages — sync admission parity', () => {
+  async function sourceWithFiles(id: string, files: string[], strategy: 'markdown' | 'code' | 'auto', subdir = '', pin: 'git-root' | 'source-root' = 'git-root') {
+    const repo = makeTmpRoot(id);
+    execFileSync('git', ['init', '-q', repo], { stdio: 'pipe' });
+    const root = join(repo, subdir);
+    mkdirSync(root, { recursive: true });
+    for (const file of files) seedFile(root, file);
+    execFileSync('git', ['-C', repo, 'add', '--', ...files.map(file => subdir ? `${subdir}/${file}` : file)], { stdio: 'pipe' });
+    execFileSync('git', ['-C', repo, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture'], { stdio: 'pipe' });
+    await runSources(engine, ['add', id, '--no-federated']);
+    await engine.executeRaw(`UPDATE sources SET local_path=$1,config=jsonb_set(config,'{strategy}',to_jsonb($2::text)) WHERE id=$3`, [root, strategy, id]);
+    await writeSlugRootMode(engine, id, pin);
+    return { id, local_path: root };
+  }
+
+  test('committed root scaffolds do not imply drift or delete independent default pages', async () => {
+    const src = await sourceWithFiles('admit-scaffolds', ['AGENTS.md', 'CLAUDE.md', 'README.md', 'admission-real.md'], 'markdown');
+    for (const slug of ['agents', 'claude', 'readme', 'admission-real']) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: `Independent default ${slug}` });
+    }
+    const before = await engine.executeRaw(`SELECT slug,compiled_truth,knowledge_revision FROM pages WHERE source_id='default' AND slug IN ('agents','claude','readme','admission-real') ORDER BY slug`);
+    const result = await findMisroutedPages(engine, [src]);
+    expect(result.count).toBe(1);
+    expect(result.sample.map(s => s.slug)).toEqual(['admission-real']);
+    expect(result.unreadable_sources).toEqual([]);
+    expect(await engine.executeRaw(`SELECT slug,compiled_truth,knowledge_revision FROM pages WHERE source_id='default' AND slug IN ('agents','claude','readme','admission-real') ORDER BY slug`)).toEqual(before);
+  });
+
+  test.each(['code', 'markdown', 'auto'] as const)('stored %s strategy determines whether a Markdown counterpart is intended', async strategy => {
+    const slug = `admission-strategy-${strategy}`;
+    const src = await sourceWithFiles(`admit-${strategy}`, [`${slug}.md`], strategy);
+    await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: 'Default-owned page' });
+    const result = await findMisroutedPages(engine, [src]);
+    expect(result.count).toBe(strategy === 'code' ? 0 : 1);
+    expect(result.sample.map(s => s.slug)).toEqual(strategy === 'code' ? [] : [slug]);
+    expect(multiSourceDriftCheck(result, 1, 'local').status).toBe(strategy === 'code' ? 'ok' : 'warn');
+  });
+
+  test.each(['git-root', 'source-root'] as const)('AGENTS below the Git root remains real content with a %s slug pin', async pin => {
+    const subdir = `admission-nested-${pin}`;
+    const src = await sourceWithFiles(`admit-nested-${pin}`, ['AGENTS.md'], 'markdown', subdir, pin);
+    const slug = pin === 'git-root' ? `${subdir}/agents` : 'agents';
+    await engine.putPage(slug, { type: 'note', title: 'Nested agent notes', compiled_truth: 'Unimported nested page' });
+    const result = await findMisroutedPages(engine, [src]);
+    expect(result.count).toBe(1);
+    expect(result.sample.map(s => s.slug)).toEqual([slug]);
+  });
+
+  test.each(['git-root', 'source-root'] as const)('persisted source-relative exclusions agree with managed sync under a %s slug pin', async pin => {
+    const subdir = `admission-exclude-${pin}`;
+    const src = await sourceWithFiles(`admit-exclude-${pin}`, ['notes/skip.md', 'raw/deep.md', 'notes/real.md'], 'markdown', subdir, pin);
+    const prefix = pin === 'git-root' ? `${subdir}/` : '';
+    for (const path of ['notes/skip', 'raw/deep', 'notes/real']) {
+      await engine.putPage(prefix + path, { type: 'note', title: path, compiled_truth: 'Independent default page' });
+    }
+    await engine.setConfig('sync.exclude', 'notes/skip.md, raw/');
+    try {
+      const result = await findMisroutedPages(engine, [src]);
+      expect(result.count).toBe(1);
+      expect(result.sample.map(s => s.slug)).toEqual([prefix + 'notes/real']);
+      expect(result.walk_truncated).toBe(false);
+    } finally { await engine.unsetConfig('sync.exclude'); }
+  });
+
+  test('reserved skill bundles and nonwaivable generated directories never imply missing knowledge pages', async () => {
+    const src = await sourceWithFiles('admit-reserved', ['skills/check/SKILL.md', 'notes/Skills/guide.md', 'venv/installed.md', 'notes/source.raw/source.md', 'notes/real.md'], 'markdown');
+    for (const slug of ['skills/check/skill', 'notes/skills/guide', 'venv/installed', 'notes/source.raw/source', 'notes/real']) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: 'Independent default page' });
+    }
+    const result = await findMisroutedPages(engine, [src]);
+    expect(result.count).toBe(1);
+    expect(result.sample.map(s => s.slug)).toEqual(['notes/real']);
+  });
+
+  test('persisted include_hidden admits genuine hidden drift without waiving explicit exclusions or generated trees', async () => {
+    const subdir = 'admission-hidden';
+    const paths = ['.notes/real.md', '.notes/skip.md', '.notes/venv/installed.md', '_notes.md'];
+    const src = await sourceWithFiles('admit-hidden', paths, 'markdown', subdir, 'source-root');
+    for (const slug of ['.notes/real', '.notes/skip', '.notes/venv/installed', '_notes']) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: 'Independent default page' });
+    }
+    await engine.setConfig('sync.include_hidden', `${subdir}/.notes/`);
+    await engine.setConfig('sync.exclude', '.notes/skip.md');
+    try {
+      const result = await findMisroutedPages(engine, [src]);
+      expect(result.count).toBe(2);
+      expect(result.sample.map(s => s.slug).sort()).toEqual(['.notes/real', '_notes']);
+      expect(result.walk_truncated).toBe(false);
+    } finally {
+      await engine.unsetConfig('sync.include_hidden');
+      await engine.unsetConfig('sync.exclude');
+    }
+  });
+
+
+  test.each(['git-root', 'source-root'] as const)('managed discovery preserves reserved-path coordinates for a %s source below skills/', async pin => {
+    const src = await sourceWithFiles(`managed-res-${pin}`, ['notes/coordinate.md'], 'markdown', `docs/skills/${pin}`, pin);
+    await withEnv({ GBRAIN_HOME: makeTmpRoot(`managed-home-${pin}`) }, async () => {
+      await claimWorktree(engine, src.id, src.local_path);
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+      try {
+        const discovery = await discoverManagedSync(engine, { sourceId: src.id, noPull: true, noEmbed: true, dryRun: true, full: true });
+        expect(discovery.slugMode).toBe(pin);
+        expect(discovery.entries.map(e => e.sourcePath)).toEqual(pin === 'git-root' ? [] : ['notes/coordinate.md']);
+      } finally { await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1'); }
+    });
+  });
+
+  test.each(['git-root', 'source-root'] as const)('drift uses the same reserved-path coordinate as a %s source below skills/', async pin => {
+    const subdir = `docs/skills/drift-${pin}`;
+    const src = await sourceWithFiles(`drift-res-${pin}`, ['notes/coordinate.md'], 'markdown', subdir, pin);
+    const slug = pin === 'git-root' ? `${subdir}/notes/coordinate` : 'notes/coordinate';
+    await engine.putPage(slug, { type: 'note', title: 'Coordinate page', compiled_truth: 'Independent default page' });
+    const result = await findMisroutedPages(engine, [src]);
+    expect(result.count).toBe(pin === 'git-root' ? 0 : 1);
+    expect(result.sample.map(s => s.slug)).toEqual(pin === 'git-root' ? [] : [slug]);
+  });
+
 });

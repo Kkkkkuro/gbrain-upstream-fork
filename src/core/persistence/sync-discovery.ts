@@ -9,7 +9,7 @@ import { managedForbiddenFlag, managedSyncFlagRefusal } from './managed-sync-fla
 import type { Action } from '../agent-output.ts';
 import type { RegistryCode } from '../error-registry.ts';
 import { buildDetachedWorkingTreeManifest, computeSyncDelta } from '../sync-delta.ts';
-import { isSyncable, isCodeFilePath, isImageFilePath, matchesAnyGlob, resolveSlugForPath } from '../sync.ts';
+import { isCodeFilePath, isImageFilePath, resolveSlugForPath, type SyncStrategy } from '../sync.ts';
 import { resolveSlugRootMode } from '../sync-anchor.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
@@ -22,7 +22,8 @@ import { currentCompanyBrainSync } from '../company-brain/profile.ts';
 import type { CompanyBrainPlan } from '../company-brain/types.ts';
 import { assertDistinctSyncOrigins, legacySyncOrigin, sameSyncOrigin, selectOriginClaimant, sharedOriginExit, syncOriginPath, type SyncOriginScope } from './sync-origin.ts';
 import { assertManagedSyncActive } from './sync-authority.ts';
-import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
+import { resolveSyncAdmission } from './sync-admission.ts';
+export { syncExcludePatterns } from './sync-admission.ts';
 import { holdRescreenDue, readGitHoldRetryPaths, readGitSourceHolds, readSyncImportProvenances } from './sync-holds.ts';
 import { readBlobContents, readTreeBlobs, SYNC_READ_BOUND } from './sync-blobs.ts';
 import { gitChildEnv } from '../git-env.ts';
@@ -57,11 +58,6 @@ export interface SyncDiscovery { binding: WorktreeBinding; root: string; gitRoot
   slice?: SyncSliceState; }
 export interface ManagedSyncContext { binding: WorktreeBinding; root: string; gitRoot: string; sourceId: string; incarnation: string;
   source: { last_commit: string | null; config: Record<string, unknown> }; }
-/** The persisted `sync.exclude` globs (plus a run's `--exclude`), as discovery matches them against a path relative to the source root. */
-export async function syncExcludePatterns(engine: Pick<BrainEngine, 'getConfig'>, extra: readonly string[] = []): Promise<string[]> {
-  return [...extra, ...(await engine.getConfig('sync.exclude') ?? '').split(/[\n,]/).map(v => v.trim()).filter(Boolean)]
-    .map(v => v.endsWith('/') ? `${v}**` : v);
-}
 /** Whether `commit` is still reachable in the checkout (a sliced target pinned before a history rewrite is not). */
 function commitExists(gitRoot: string, commit: string): boolean {
   try { syncGit(gitRoot, ['cat-file', '-e', `${commit}^{commit}`]); return true; } catch { return false; }
@@ -273,13 +269,10 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
     slugPrefix: probe.slice(0, -2), dryRun: true }) : 'git-root';
   const sourcePath = (path: string) => slugMode === 'source-root' && scope ? path.slice(scope.length + 1) : path;
   const originScope: SyncOriginScope = { sourceId, root, scope, slugMode };
-  const exclude = await syncExcludePatterns(engine, opts.exclude);
-  const includeHidden = [...new Set([...(opts.includeHidden ?? []), ...(await engine.getConfig('sync.include_hidden') ?? '')
-    .split(/[\n,]/).map(v => v.trim()).filter(Boolean)].map(v => v.endsWith('/') ? `${v}**` : v))];
-  // Reserved skillpack paths belong to the shared skill publisher; the managed importer always refuses them.
+  const admission = await resolveSyncAdmission(engine, { ...opts, strategy: strategy as SyncStrategy });
+  // Discovery and Doctor use the same persisted scope and reserved-path admission.
   const eligible = (path: string) => (!scope || path.startsWith(`${scope}/`)) &&
-    !matchesAnyGlob(scope ? path.slice(scope.length + 1) : path, exclude) && !isReservedSkillBundlePath(sourcePath(path)) &&
-    isSyncable(path, { strategy: strategy as 'markdown', includeHidden });
+    admission.eligible(path, scope ? path.slice(scope.length + 1) : path, sourcePath(path));
   const target = stage?.target ?? company?.plan.revision?.commit ?? syncGit(gitRoot, ['rev-parse', 'HEAD']).trim();
   const head = stage?.head ?? target;
   const slicing = stage?.slice ?? null;
