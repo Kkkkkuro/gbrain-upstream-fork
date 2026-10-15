@@ -199,10 +199,10 @@ function route(input: TerminalInput): Partial_ {
       argv: ['gbrain', 'sources', 'writer', 'status', '--source', source, '--probe', '--json'] } };
   }
   if (origin === 'owner_exception') {
-    return { category: 'owner_exception', code, origin, class: 'systemic', safe_actions: ['upgrade'], needs_human: true,
-      human_reason: 'The owner raised an unexpected exception while running this write: a gbrain defect.',
-      escalate: 'always: report the error class and frame writer status shows',
-      action: inspect(source, 'Writer status names the error class, errno, frame and the build that ran the attempt, read-only.',
+    return { category: 'owner_exception', code, origin, class: 'systemic', safe_actions: ['none'], needs_human: true,
+      human_reason: 'The owner raised an unexpected exception while running this write; the underlying cause is unknown until diagnosed.',
+      escalate: 'always: report the retained error identity and any available frame',
+      action: inspect(source, `Writer status shows the retained error identity and attempt build, read-only. ${stringField(detail, 'frame') ? 'A frame is recorded in error_detail.' : 'The frame is absent; the receipt alone cannot identify the failing statement.'}`,
         'Report the owner exception (gbrain sources writer status --json on the brain host names it) with the gbrain version; upgrade when a fix ships.') };
   }
   if (code === 'storage_error' || code === 'writer_coordinator_required') {

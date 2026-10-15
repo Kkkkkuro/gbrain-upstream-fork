@@ -13,6 +13,15 @@ const base: TerminalInput = { source_id: 'src', slug: 'projects/acme-example', o
   recovery: null, blocked_reason: null, compacted: false };
 
 describe('classifyTerminal (#6696 C10)', () => {
+  test('owner exceptions without a retained frame request diagnosis, not an assumed upgrade or retry', () => {
+    const verdict = classifyTerminal({ ...base, state: 'failed', error_code: 'storage_error',
+      error_detail: { origin: 'owner_exception', errno: '0A000', error_class: 'PostgresError' } })!;
+    expect(verdict).toMatchObject({ category: 'owner_exception', defect: true, historical: false, safe_actions: ['none'] });
+    expect(verdict.human_reason).toContain('unknown');
+    expect(verdict.action.why).toContain('frame is absent');
+    expect(verdict.action.argv).toEqual(['gbrain', 'sources', 'writer', 'status', '--source', 'src', '--json']);
+    expect(verdict.action.user_message).not.toContain('retry');
+  });
   test('a missing canonical file is its own category whose exit is the ghost-page repair, by message or recorded reason', () => {
     const byMessage = classifyTerminal({ ...base, error_code: 'source_changed', error_message: 'The canonical file was removed outside coordinated publication.' })!;
     const byReason = classifyTerminal({ ...base, error_code: 'source_changed', compacted: true, error_detail: { reason: 'canonical_file_missing' } })!;

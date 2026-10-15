@@ -20,6 +20,7 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { publicFailureDetail, OWNER_EXCEPTION_MESSAGE } from '../src/core/persistence/publication-failure.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { readWriterDiagnostics } from '../src/core/persistence/diagnostics.ts';
 import { VERSION } from '../src/version.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -78,6 +79,58 @@ describe('#5929 owner exceptions keep a bounded identity', () => {
     expect(row.error_message).toBe(OWNER_EXCEPTION_MESSAGE);
     expect(row.error_message).not.toContain('ENOSPC');
     expect(JSON.stringify(row)).not.toContain('alice-example');
+  });
+
+  // Protects the trusted writer-status guidance, which the existing public-receipt tests do not read.
+  // Regresses if unknown owner/database origins are again routed to a trigger repair; uses the real reader,
+  // stored receipts and existing fault seam, with no new production seam or real provider/database access.
+  test('writer status preserves an owner exception without claiming a database trigger or a known cause', async () => {
+    class PostgresError extends Error { code = '0A000'; }
+    const error = new PostgresError('PRIVATE_DATABASE_TEXT');
+    error.stack = 'PostgresError: PRIVATE_DATABASE_TEXT\n    at publish (/example/gbrain/src/core/persistence/sync-prepare.ts:100:2)';
+    const { row } = await failingWrite(error);
+    const status = await readWriterDiagnostics(engine);
+    const failure = status.recent_failures.find(f => f.request_id === row.request_id)!;
+    expect(failure.error_code).toBe('storage_error');
+    const storedDetail = row.error_detail;
+    if (!storedDetail) throw new Error('owner exception lost its recorded identity');
+    expect(failure.error_detail).toEqual(storedDetail);
+    expect(failure.error_detail).toMatchObject({ origin: 'owner_exception', errno: '0A000', error_class: 'PostgresError',
+      frame: 'src/core/persistence/sync-prepare.ts:100', attempt: { consumer_version: VERSION } });
+    expect(failure.next_action).toContain('owner exception');
+    expect(failure.next_action).toContain('cause is unknown');
+    expect(failure.next_action).toContain('consumer log');
+    expect(failure.next_action).toContain('report');
+    expect(failure.next_action).not.toContain('A database trigger refused');
+    expect(failure.next_action).not.toContain('apply-migrations');
+    expect(JSON.stringify(status)).not.toContain('PRIVATE_DATABASE_TEXT');
+  });
+
+  test.each(['database', 'future_origin'])('writer status leaves a %s cause unknown instead of guessing a trigger', async origin => {
+    const { row } = await failingWrite(new Error('PRIVATE_DATABASE_TEXT'));
+    const detail = { origin, sqlstate: 'P0001', reason: 'unknown', stage: 'publication' };
+    await engine.executeRaw('UPDATE persistence_requests SET error_detail=$2::jsonb WHERE id=$1::uuid', [row.id, JSON.stringify(detail)]);
+    const failure = (await readWriterDiagnostics(engine)).recent_failures.find(f => f.request_id === row.request_id)!;
+    expect(failure.error_code).toBe('storage_error');
+    expect(failure.error_detail).toEqual(detail);
+    expect(failure.next_action).toContain('cause is unknown');
+    expect(failure.next_action).toContain('gbrain write-request');
+    expect(failure.next_action).not.toContain('A database trigger refused');
+    expect(failure.next_action).not.toContain('apply-migrations');
+  });
+
+  test.each(['pending_import', 'sync_held'])('writer status keeps %s file refusals distinct from trigger or owner failures', async origin => {
+    const { row } = await failingWrite(new Error('PRIVATE_DATABASE_TEXT'));
+    const detail = { origin, stage: 'publication' };
+    await engine.executeRaw("UPDATE persistence_requests SET error_code='source_changed',error_detail=$2::jsonb WHERE id=$1::uuid", [row.id, JSON.stringify(detail)]);
+    const failure = (await readWriterDiagnostics(engine)).recent_failures.find(f => f.request_id === row.request_id)!;
+    expect(failure.error_code).toBe('source_changed');
+    expect(failure.error_detail).toEqual(detail);
+    expect(failure.next_action).toContain('gbrain sync status');
+    expect(failure.next_action).toContain(origin === 'pending_import' ? 'committed change' : 'holds the canonical file');
+    expect(failure.next_action).not.toContain('cause is unknown');
+    expect(failure.next_action).not.toContain('A database trigger refused');
+    expect(failure.next_action).not.toContain('apply-migrations');
   });
 
   test('the receipt any caller reads carries none of the owner-only fields', async () => {

@@ -135,6 +135,24 @@ export function capacityDiagnostics(counters: Counter[], limits: JournalLimits) 
     });
   });
 }
+/** Route guidance by recorded origin; an owner exception is not evidence of a database trigger. */
+function recentFailureNextAction(origin: unknown): string {
+  if (origin === 'database_guard') return DATABASE_REFUSAL_HINT;
+  if (origin === 'database_trigger') return DATABASE_TRIGGER_HINT;
+  if (origin === 'pending_import') return 'A committed change in the canonical file has not been imported yet. '
+    + 'Inspect gbrain sync status --source <source> --json and the receipt diagnosis; let managed sync import the current file before correcting the write. '
+    + 'A remember may already be queued for one automatic replay: do not save it again while that replay is pending. Other callers read the latest page before resubmitting.';
+  if (origin === 'sync_held') return 'Sync holds the canonical file, so this write was refused. '
+    + 'Inspect gbrain sync status --source <source> --json for the held file and follow its recorded reason and fix, including any approval it requires. '
+    + 'Do not resubmit the refused write while the file is held.';
+  if (origin === 'owner_exception') return 'An unexpected owner exception ended this write; its specific cause is unknown from the recorded identity alone. '
+    + 'Inspect error_detail (error_class, errno, frame and attempt.consumer_version) and the persistence consumer log on the brain host; '
+    + 'report the bounded error identity and gbrain version on the issue tracker, keeping private log text on the host. '
+    + 'The attempt build is historical, not proof an older process is still running. Upgrade when a fix for this exception ships; do not replay an old intent to diagnose it.';
+  return 'The specific cause is unknown to this diagnostic; the recorded origin does not establish a database trigger refusal. '
+    + 'Inspect error_code and error_detail, then run gbrain write-request <request_id> --json on the brain host and follow its diagnosis.fix. '
+    + 'If the receipt still cannot name a cause, report the bounded diagnostic and gbrain version; do not guess a schema change or replay the old intent.';
+}
 /** Trusted-admin counts only: neither normalized intent nor private paths leave here. */
 export async function readWriterDiagnostics(engine: BrainEngine) {
   // #6482: writer status is the probe the mode refusal names, so a malformed singleton is reported here, never refused.
@@ -190,7 +208,7 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
     : 'The resident consumer of the process that answered this status.' };
   return { ...brain, sampled_at: new Date().toISOString(), publication_concurrency: publicationConcurrency(engine),
     local_process_ingress, worktrees, counters, queue, effects, limits, capacity: capacityDiagnostics(counters, limits), preparation_policy,
-    recent_failures: failures.map(row => ({ ...row, next_action: row.error_detail?.origin === 'database_guard' ? DATABASE_REFUSAL_HINT : DATABASE_TRIGGER_HINT })),
+    recent_failures: failures.map(row => ({ ...row, next_action: recentFailureNextAction(row.error_detail?.origin) })),
     backend_visibility: backends.visibility,
     blockers: blockers.map(({ id: rowId, claim_phase: _phase, execution_token: _token, claim_lapsed: _lapsed, publication_started: _started, ...row }, index) => {
       const health = writeHealth(row);
