@@ -26,8 +26,8 @@ const report='projects/caseproject/designs/history.md',moved='projects/CaseProje
 const a=Buffer.from('{"id":1}\n{"id":2}\n{"id":3}\n');
 const b=Buffer.concat([a,Buffer.from('{"id":4}\n{"id":5}\n')]);
 const c=Buffer.from('# Historical report\nAll original bytes.\n');
-async function setup(f:RefreshFixture):Promise<CaseRecoveryPreview> {
- const blobs=[a,b,c].map(data=>g(f.upstream,['hash-object','-w','--stdin'],data).toString().trim());
+async function setup(f:RefreshFixture,sameAliases=false):Promise<CaseRecoveryPreview> {
+ const blobs=[sameAliases?b:a,b,c].map(data=>g(f.upstream,['hash-object','-w','--stdin'],data).toString().trim());
  for(const [i,path] of [keep,remove,report].entries())g(f.upstream,['update-index','--add','--cacheinfo',`100644,${blobs[i]},${path}`]);
  const executable=Buffer.from('#!/bin/sh\nexit 0\n');
  const executableOid=g(f.upstream,['hash-object','-w','--stdin'],executable).toString().trim();
@@ -162,4 +162,19 @@ test('unrelated tracked dirt refuses case recovery before any admission or merge
  const dirty=Buffer.concat([readFileSync(path),Buffer.from('Unrelated local change.\n')]);writeFileSync(path,dirty);
  await errorCode(refreshWorktree(engine,f.alpha,{caseRecovery:p}),'refresh_dirty');
  expect(await f.refreshRows()).toEqual([]);expect(f.head()).toBe(p.oldHead);expect(readFileSync(path)).toEqual(dirty);expect(readFileSync(join(f.root,'.git/index'))).toEqual(before);
+}),120000);
+
+
+test('clean identical aliases still require and complete an explicit byte-preserving transition',()=>withRefreshFixture(engine,async f=>{
+ const p=await setup(f,true),before=readFileSync(join(f.root,'.git/index'));
+ expect(g(f.root,['status','--porcelain']).toString()).toBe('');
+ expect((await refreshWorktree(engine,f.alpha,{caseRecovery:p,dryRun:true})).status).toBe('dry_run');
+ expect(await f.refreshRows()).toEqual([]);expect(readFileSync(join(f.root,'.git/index'))).toEqual(before);
+ const result=await refreshWorktree(engine,f.alpha,{caseRecovery:p});
+ expect(result.status).toBe('completed');expect(f.head()).toBe(p.targetHead);
+ expect(readFileSync(join(f.root,keep))).toEqual(b);expect(readFileSync(join(f.root,moved))).toEqual(c);
+ expect(g(f.root,['status','--porcelain']).toString()).toBe('');
+ expect(g(f.root,['show',`${p.oldHead}:${keep}`])).toEqual(b);
+ expect(g(f.root,['show',`${p.oldHead}:${remove}`])).toEqual(b);
+ expect((await f.refreshRows())[0].outcome.case_recovery).toBeDefined();
 }),120000);

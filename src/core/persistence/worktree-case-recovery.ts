@@ -108,7 +108,7 @@ function validateCasePreviewImpl(root:string,binding:WorktreeBinding,oldHead:str
   if(p.version!==1||binding.worktree_id!==p.worktreeId||String(binding.owner_epoch)!==p.ownerEpoch||String(binding.topology_generation)!==p.topologyGeneration||oldHead!==p.oldHead||targetHead!==p.targetHead) refuse('preview identity/epoch/commit changed');
   if(!/^[a-f0-9]{64}$/.test(p.indexSha256)||! /^[a-f0-9]{64}$/.test(p.materializedSha256)) refuse('invalid digest');
   if(p.keep===p.remove||p.keep.toLowerCase()!==p.remove.toLowerCase()||/[^\x20-\x7e]/.test(p.keep+p.remove)) refuse('not an ASCII case alias');
-  if(!overlap.length||overlap.some(path=>path!==p.keep && path!==p.remove)) refuse('unbound dirt overlaps incoming files');
+  if(overlap.some(path=>path!==p.keep && path!==p.remove)) refuse('unbound dirt overlaps incoming files');
   if(text(git(root,['rev-parse','HEAD'])).trim()!==p.oldHead||text(git(root,['rev-parse','@{upstream}'])).trim()!==p.targetHead) refuse('HEAD/upstream changed');
   if(digest(file(indexPath(root)))!==p.indexSha256) refuse('index drifted');
   const before=entries(root),old=entries(root,p.oldHead),target=entries(root,p.targetHead);
@@ -117,6 +117,10 @@ function validateCasePreviewImpl(root:string,binding:WorktreeBinding,oldHead:str
   targetPortable(target);
   const keep=old.find(e=>e.path===p.keep),remove=old.find(e=>e.path===p.remove),next=target.find(e=>e.path===p.keep);
   if(!keep||!remove||!next||target.some(e=>e.path===p.remove)||keep.mode!==remove.mode||next.mode!==keep.mode) refuse('alias entries/modes do not match');
+  // Identical aliases can report a clean worktree. Deleting one Git entry can
+  // still unlink their shared physical file, so an explicit bound transition
+  // is required. Empty overlap is allowed only for exact identical old blobs.
+  if(!overlap.length && keep.oid!==remove.oid) refuse('clean alias entries differ');
   const a=physical(root,p.keep),b=physical(root,p.remove),as=statSync(a),bs=statSync(b);
   if(as.dev!==bs.dev||as.ino!==bs.ino) refuse('paths are not aliases on this filesystem');
   const materialized=file(a),older=blob(root,keep.oid),newer=blob(root,remove.oid);
