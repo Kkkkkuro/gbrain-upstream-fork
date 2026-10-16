@@ -36,12 +36,16 @@ import { appendContextNote } from './subject-infer.ts';
 import { normalizeTargetFences } from '../fence-repair/import-step.ts';
 import { refuseUnparsedRewrite } from '../fence-repair/refusal.ts';
 import { pageFencesNormalized } from '../fence-repair/report.ts';
+import { isFactEntityPage } from '../entities/resolve.ts';
+import { assertManualFenceUnchanged, manualProjectionMatches, manualTargetFactsHash, readManualRelinkBody, readManualRelinkTarget } from './relink-manual-guards.ts';
+import type { Page } from '../types.ts';
 
 export const RELINK_OPERATION = 'relink_facts';
 
 /** One fact in a relink request: its pinned row hash and how its subject was found. */
-export interface RelinkIntentFact { id: number; hash: string; tier: string; model: string | null; note: string }
-export interface RelinkIntent { kind: 'relink_facts'; run_id: string; queue_conflict: boolean; facts: RelinkIntentFact[] }
+export interface RelinkIntentFact { id: number; hash: string; tier: string; model: string | null; note: string; full_hash?: string }
+export interface ManualRelinkBinding { brain_id: string; source_incarnation: string; page_id: number; revision: string; classification_key: string; target_facts_hash: string }
+export interface RelinkIntent { kind: 'relink_facts'; run_id: string; queue_conflict: boolean; facts: RelinkIntentFact[]; manual?: ManualRelinkBinding }
 
 export interface RelinkGroupOutcome {
   linked: Array<{ id: number; row_num: number }>;
@@ -63,12 +67,16 @@ type Classified =
   | { id: number; action: 'skip'; reason: RelinkSkipReason };
 
 /** The fence cell a relinked row renders as. */
-function fenceRow(v: Record<string, unknown>, rowNum: number, context: string) {
+function fenceRow(v: Record<string, unknown>, rowNum: number, context: string, exactDates = false) {
+  const date = (value: unknown) => {
+    const d = new Date(String(value));
+    return exactDates && d.getUTCMilliseconds() !== 0 ? d.toISOString() : formatFenceDate(d);
+  };
   return {
     rowNum, claim: String(v.fact), kind: v.kind as never, confidence: Number(v.confidence ?? 1),
     visibility: v.visibility as never, notability: (v.notability ?? 'medium') as never,
-    validFrom: formatFenceDate(new Date(String(v.valid_from))),
-    validUntil: v.valid_until ? formatFenceDate(new Date(String(v.valid_until))) : undefined,
+    validFrom: date(v.valid_from),
+    validUntil: v.valid_until ? date(v.valid_until) : undefined,
     source: v.source == null ? undefined : String(v.source),
     context,
     ...(v.claim_metric ? { claimMetric: String(v.claim_metric) } : {}),
@@ -84,11 +92,13 @@ function fenceRow(v: Record<string, unknown>, rowNum: number, context: string) {
  * parsing back to the same active claim and visibility) would be expired and
  * re-inserted as a different fact by the page projection, so it is never moved.
  */
-function roundTrips(v: Record<string, unknown>, context: string): boolean {
-  const parsed = parseFactsFence(upsertFactRow('', fenceRow(v, 1, context)).body);
+function roundTrips(v: Record<string, unknown>, context: string, exact = false): boolean {
+  const parsed = parseFactsFence(upsertFactRow('', fenceRow(v, 1, context, exact)).body);
   const cell = parsed.facts[0];
-  return parsed.warnings.length === 0 && parsed.facts.length === 1 && cell!.active && cell!.claim === String(v.fact)
+  const base = parsed.warnings.length === 0 && parsed.facts.length === 1 && cell!.active && cell!.claim === String(v.fact)
     && cell!.visibility === v.visibility && (cell!.context ?? '') === context;
+  if (!base || !exact) return base;
+  return manualProjectionMatches({ ...v, context }, cell!);
 }
 
 function isActiveUnlinked(v: Record<string, unknown>, now: number): boolean {
@@ -96,12 +106,23 @@ function isActiveUnlinked(v: Record<string, unknown>, now: number): boolean {
     && (v.valid_until === null || new Date(String(v.valid_until)).getTime() > now);
 }
 
-async function classify(db: BrainEngine, row: WriteRequest, intent: RelinkIntent, lock: boolean): Promise<Classified[]> {
+/** Manual previews pin the full stored row, including the vector and timestamps. */
+export async function readFullRelinkFacts(db: BrainEngine, sourceId: string, ids: number[], lock = false): Promise<FactSnapshot[]> {
+  const rows = await db.executeRaw<FactSnapshot>(`SELECT f.id,to_jsonb(f) AS value FROM facts f
+    WHERE f.source_id=$1 AND f.id=ANY($2::integer[]) ORDER BY f.id${lock ? ' FOR UPDATE' : ''}`, [sourceId, ids]);
+  return rows.map(r => ({ ...r, id: Number(r.id) }));
+}
+
+async function classify(db: BrainEngine, row: Pick<WriteRequest, 'source_id' | 'slug'>, intent: RelinkIntent, lock: boolean): Promise<Classified[]> {
   const current = await readFacts(db, row.source_id, intent.facts.map(f => f.id), lock);
+  const full = intent.manual ? await readFullRelinkFacts(db, row.source_id, intent.facts.map(f => f.id), lock) : [];
   const now = Date.now();
   const seen = new Map<string, { id: number; visibility: string }>();
   const out: Classified[] = [];
   for (const f of intent.facts) {
+    if (intent.manual && (!f.full_hash || relinkFactHash(full.find(c => c.id === f.id) ?? { id: f.id, value: {} }) !== f.full_hash)) {
+      throw opError('revision_conflict', 'A manually mapped fact changed after preview.', 'Nothing was linked. Preview and review a new mapping; do not rebase the old manifest automatically.');
+    }
     const snap = current.find(c => c.id === f.id);
     if (!snap || relinkFactHash(snap) !== f.hash || !isActiveUnlinked(snap.value, now)) {
       out.push({ id: f.id, action: 'skip', reason: 'revision_conflict' });
@@ -109,7 +130,7 @@ async function classify(db: BrainEngine, row: WriteRequest, intent: RelinkIntent
     }
     const v = snap.value;
     const visibility = v.visibility as 'private' | 'world';
-    if (!roundTrips(v, appendContextNote(v.context as string | null, f.note))) {
+    if (!roundTrips(v, appendContextNote(v.context as string | null, f.note), !!intent.manual)) {
       out.push({ id: f.id, action: 'skip', reason: 'claim_unfenceable' });
       continue;
     }
@@ -150,6 +171,36 @@ async function classify(db: BrainEngine, row: WriteRequest, intent: RelinkIntent
 const classKey = (c: Classified[]) => JSON.stringify(c.map(x => x.action === 'link' ? [x.id, 'link']
   : x.action === 'retire' ? [x.id, 'retire', x.duplicateOf] : [x.id, 'skip', x.reason]));
 
+/** Read-only duplicate/withdrawal/visibility classification shared with publication. */
+export async function previewRelinkClassification(engine: BrainEngine, sourceId: string, slug: string, intent: RelinkIntent) {
+  const classified = await classify(engine, { source_id: sourceId, slug }, intent, false);
+  if (intent.manual) {
+    const snapshot = await readManualRelinkTarget(engine, sourceId, slug);
+    if (!snapshot) throw opError('page_not_found', 'The manual target disappeared.', 'Preview an existing entity in this source.');
+    await assertManualBinding(engine, sourceId, intent, snapshot.page, snapshot.revision);
+    const original = await readManualRelinkBody(engine, sourceId, snapshot.page, snapshot.revision);
+    const [max] = await engine.executeRaw<{ n: number }>('SELECT COALESCE(MAX(row_num),0)::int AS n FROM facts WHERE source_id=$1 AND source_markdown_slug=$2', [sourceId, slug]);
+    let next = Math.max(Number(max?.n ?? 0), 0, ...parseFactsFence(original).facts.map(f => f.rowNum)) + 1;
+    let body = original;
+    for (const c of classified) if (c.action === 'link') body = upsertFactRow(body,
+      fenceRow(c.value, next++, appendContextNote(c.value.context as string | null, intent.facts.find(f => f.id === c.id)!.note), true)).body;
+    assertManualFenceUnchanged(original, body);
+  }
+  return { key: classKey(classified), outcomes: classified.map(c => c.action === 'link' ? { id: c.id, action: c.action }
+    : c.action === 'retire' ? { id: c.id, action: c.action, duplicate_of: c.duplicateOf } : { id: c.id, action: c.action, reason: c.reason }) };
+}
+
+async function assertManualBinding(engine: BrainEngine, sourceId: string, intent: RelinkIntent, page: Pick<Page, 'id' | 'slug' | 'type' | 'body_storage'>, revision: string, lock = false) {
+  if (!intent.manual) return;
+  const [brain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
+  const [source] = await engine.executeRaw<{ incarnation: string; archived: boolean }>('SELECT incarnation,archived FROM sources WHERE id=$1', [sourceId]);
+  const m = intent.manual;
+  if (m.brain_id !== brain?.brain_id || source?.archived !== false || m.source_incarnation !== source.incarnation || m.page_id !== page.id || m.revision !== revision
+    || !isFactEntityPage(page.slug, page.type) || m.target_facts_hash !== await manualTargetFactsHash(engine, sourceId, page.slug, await readManualRelinkBody(engine, sourceId, page, revision), lock)) {
+    throw opError('revision_conflict', 'The manual relink preview no longer matches this brain, source or page.', 'Nothing was linked. Inspect the original manifest and preview a new mapping only after reviewing the changed target.');
+  }
+}
+
 export async function prepareRelinkMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
   const intent = row.intent as unknown as RelinkIntent | null;
   const rerun = `The next gbrain facts relink --source ${row.source_id} run re-plans from current state; preview it with --dry-run (no model calls, no writes).`;
@@ -165,7 +216,9 @@ export async function prepareRelinkMutation(engine: BrainEngine, row: WriteReque
       `${row.slug} in ${row.source_id} was deleted or replaced after relink request ${row.request_id} was accepted, so nothing was written. ${rerun}`);
   }
   const observedRevision = snapshot.revision;
+  await assertManualBinding(engine, row.source_id, intent, snapshot.page, observedRevision);
   const planned = await classify(engine, row, intent, false);
+  if (intent.manual && classKey(planned) !== intent.manual.classification_key) throw changed('The reviewed manual classification changed.');
   const byId = new Map(intent.facts.map(f => [f.id, f]));
   const links = planned.filter((c): c is Extract<Classified, { action: 'link' }> => c.action === 'link');
 
@@ -189,15 +242,17 @@ export async function prepareRelinkMutation(engine: BrainEngine, row: WriteReque
       rowNums.set(link.id, rowNum);
       // #6385 R12: a fence that does not parse cleanly refuses typed (`fence_malformed` below) instead of losing rows.
       body = refuseUnparsedRewrite({ compiled_truth: body, timeline }, row.slug, row.source_id,
-        () => upsertFactRow(body, fenceRow(v, rowNum, appendContextNote(v.context as string | null, byId.get(link.id)!.note))).body);
+        () => upsertFactRow(body, fenceRow(v, rowNum, appendContextNote(v.context as string | null, byId.get(link.id)!.note), !!intent.manual)).body);
     }
   }
   const page = links.length ? await (await import('../persistence/page-prepare.ts')).preparePageMutation(engine, { ...row, intent: {
     content: serializePageToMarkdown({ ...snapshot.page, compiled_truth: body, timeline }, snapshot.tags), expected_revision: observedRevision, force: false,
   } }, config) : undefined;
   if (page && page.observedRevision !== observedRevision) throw changed('The relink target page changed during preparation.');
+  if (intent.manual) assertManualFenceUnchanged(snapshot.page.compiled_truth, body);
 
   const validate = async (tx: BrainEngine) => {
+    if (intent.manual) await assertManualBinding(tx, row.source_id, intent, snapshot.page, observedRevision, true);
     if (classKey(await classify(tx, row, intent, true)) !== classKey(planned)) {
       throw changed('A relinked fact changed during preparation.');
     }
@@ -259,13 +314,22 @@ export async function submitRelinkGroup(engine: BrainEngine, config: GBrainConfi
   intent: RelinkIntent): Promise<RelinkGroupResult> {
   const { initializeLocalPersistence, requestPrincipalForContext } = await import('../persistence/page-mutations.ts');
   const { submissionAuthority } = await import('../persistence/authority.ts');
-  const { admitWrite, getWriteRequest } = await import('../persistence/journal.ts');
+  const { admitWrite, assertReplayIntent, getWriteRequest, intentDigest } = await import('../persistence/journal.ts');
   const { assertPersistenceAccepting, waitForWrite, writeResponse } = await import('../persistence/service.ts');
   const { resolveFactWriteTarget } = await import('../persistence/fact-write-target.ts');
   const ctx = { engine, sourceId, remote: false as const, config, dryRun: false, logger: { info() {}, warn() {}, error() {} } } as unknown as OperationContext;
   assertPersistenceAccepting(engine);
   await initializeLocalPersistence(ctx);
   const principal = await requestPrincipalForContext(ctx);
+  const key = digest({ sourceId, slug, run: intent.run_id, facts: intent.facts.map(f => [f.id, f.hash]), ...(intent.manual ? { manual: intent.manual } : {}) });
+  const requestId = intent.manual ? intent.run_id : `${key.slice(0, 8)}-${key.slice(8, 12)}-4${key.slice(13, 16)}-a${key.slice(17, 20)}-${key.slice(20, 32)}`;
+  const prior = await getWriteRequest(engine, principal, requestId);
+  if (prior) {
+    assertReplayIntent(prior, intentDigest({ operation: RELINK_OPERATION, sourceId, slug, callerIntent: intent as unknown as Record<string, unknown> }));
+    const finished = await waitForWrite(engine, prior, config, 60_000);
+    writeResponse(finished);
+    return { ok: true, outcome: finished.outcome as unknown as RelinkGroupOutcome };
+  }
   const [source] = await engine.executeRaw<{ incarnation: string; archived: boolean; local_path: string | null; kind: string | null }>(
     "SELECT incarnation, archived, local_path, config->>'kind' AS kind FROM sources WHERE id = $1", [sourceId]);
   if (!source || source.archived) {
@@ -274,6 +338,7 @@ export async function submitRelinkGroup(engine: BrainEngine, config: GBrainConfi
   }
   const snapshot = await engine.readPageSnapshot(slug, { sourceId });
   if (!snapshot) return { ok: false, reason: 'no_page', message: `${slug} no longer exists` };
+  await assertManualBinding(engine, sourceId, intent, snapshot.page, snapshot.revision);
   let target: Awaited<ReturnType<typeof resolveFactWriteTarget>>;
   try {
     target = await resolveFactWriteTarget(engine, sourceId, source, { fileBacked: Boolean(snapshot.page.source_path), remote: false });
@@ -284,10 +349,8 @@ export async function submitRelinkGroup(engine: BrainEngine, config: GBrainConfi
   if (target.kind === 'unbound') return { ok: false, reason: 'unfenceable', message: `source ${sourceId} writes through to ${target.root} but has no canonical owner` };
   const authority = await submissionAuthority(ctx, RELINK_OPERATION, sourceId, source.incarnation, slug);
   if (target.databaseOnlyReason) authority.databaseOnlyReason = target.databaseOnlyReason;
-  const key = digest({ sourceId, slug, run: intent.run_id, facts: intent.facts.map(f => [f.id, f.hash]) });
-  const requestId = `${key.slice(0, 8)}-${key.slice(8, 12)}-4${key.slice(13, 16)}-a${key.slice(17, 20)}-${key.slice(20, 32)}`;
   try {
-    const row = await getWriteRequest(engine, principal, requestId) ?? await admitWrite(engine, {
+    const row = await admitWrite(engine, {
       principal, operation: RELINK_OPERATION, sourceId, sourceIncarnation: source.incarnation, slug, pageId: snapshot.page.id,
       requestId, callerIntent: intent as unknown as Record<string, unknown>, intent: intent as unknown as Record<string, unknown>, authority,
       worktreeId: target.binding?.worktree_id ?? null, topologyGeneration: target.binding?.topology_generation ?? null,

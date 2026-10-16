@@ -7,6 +7,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import type { GBrainConfig } from '../core/config.ts';
 import { RELINK_DEFAULT_LIMIT, RELINK_DEFAULT_MAX_USD, runFactsRelink, type RelinkOptions, type RelinkReport } from '../core/facts/relink.ts';
 import { RELINK_REASONS, type RelinkReason } from '../core/facts/relink-reasons.ts';
+import { isManualRelinkArgs, runManualRelinkCommand } from './facts/manual.ts';
 
 export function factsHelpText(): string {
   return `Usage: gbrain facts <subcommand>
@@ -28,6 +29,10 @@ gbrain facts relink [flags]
   --no-conflict-queue    Do not queue linked facts for the conflict sweep
   --examples <n>         Example facts per outcome (default 3)
   --json                 Machine-readable report (schema_version ${1})
+  --mapping <json> --manifest-out <json> --dry-run
+                         Preview an explicit operator mapping (one existing target)
+  --apply-manifest <json> --allow-page-effects
+                         Apply that exact preview; page embedding may be queued
 
 Relink never creates pages and never supersedes a fact. Exact duplicates are
 retired (expired, kept in history). Linked facts are queued for the System One
@@ -140,6 +145,7 @@ export async function runFactsCommand(engine: BrainEngine, args: string[], confi
     console.log(factsHelpText());
     return 0;
   }
+  if (isManualRelinkArgs(rest)) return runManualRelinkCommand(engine, config, sourceId, rest);
   const parsed = parseRelinkArgs(rest, sourceId);
   if (parsed.error) {
     console.error(`gbrain facts relink: ${parsed.error}`);

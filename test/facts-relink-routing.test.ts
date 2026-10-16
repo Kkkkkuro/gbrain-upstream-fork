@@ -15,6 +15,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { serializePageToMarkdown } from '../src/core/markdown.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
 import { runFactsRelink } from '../src/core/facts/relink.ts';
+import { applyManualRelink, previewManualRelink } from '../src/core/facts/relink-manual.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 import { activatePersistence } from '../src/core/persistence/activation.ts';
 import { claimWorktree } from '../src/core/persistence/ownership.ts';
@@ -109,6 +110,15 @@ test(`${backend}: remember falls back when the inferred entity's canonical file 
   const outcome = saved.write_request?.outcome ?? saved;
   expect(outcome.entity_slug ?? null).toBeNull();
   expect(outcome.warnings).toEqual(['ENTITY_LINK_FAILED']);
+}));
+
+test(`${backend}: an explicit mapping publishes its original fact to the canonical file`, async () => withEnv({ GBRAIN_HOME: home }, async () => {
+  const slug='companies/explicit-example';await seedEntity(slug,'Explicit Example',true);
+  const id=await unlinked('一条已由操作者核对主体的合成事实。');
+  const manifest=await previewManualRelink(engine,'default',{target_slug:slug,fact_ids:[id],evidence:'Synthetic source reviewed by operator.'});
+  expect((await applyManualRelink(engine,config,'default',manifest)).ok).toBe(true);
+  const rowNum=await expectAdopted(id,slug);
+  expect(parseFactsFence(readFileSync(join(repo,`${slug}.md`),'utf8')).facts.find(f=>f.rowNum===rowNum)?.claim).toBe('一条已由操作者核对主体的合成事实。');
 }));
 
 test(`${backend}: a managed brain publishes the same way through the coordinator`, async () => withEnv({ GBRAIN_HOME: home }, async () => {

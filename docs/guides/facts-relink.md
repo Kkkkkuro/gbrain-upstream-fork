@@ -78,6 +78,50 @@ mention`, `... from page`, `... by model (<model>)`). An exact duplicate of a
 fact the entity already has is retired: expired, kept in history, never
 deleted. Relink never creates pages and never supersedes a fact.
 
+### Explicit operator mappings
+
+When inference cannot safely verify an unspaced name, the host operator can
+review an explicit mapping to one existing entity without forgetting and
+recreating the facts. This path does not change the inference rules or create
+entity pages. Keep ambiguous and subjectless facts unassigned.
+
+Create a private mapping file with real reviewed IDs and evidence (these IDs
+and the entity below are synthetic):
+
+```json
+{"target_slug":"people/example-person","fact_ids":[123,124],"evidence":"Reviewed the original source; both claims refer to this existing subject."}
+```
+
+```bash
+gbrain facts relink --source default --mapping mapping.json --manifest-out reviewed.json --dry-run
+gbrain facts relink --source default --apply-manifest reviewed.json --allow-page-effects
+```
+
+Preview makes no database or provider writes and creates a new 0600 manifest;
+it refuses to overwrite a saved manifest. Review every mapping and duplicate
+retirement before applying. **Subject inference calls no model, but applying
+can queue paid page embedding under the existing publication policy.** Obtain
+the operator's cost authorization before passing `--allow-page-effects`; this
+flag is not a new budget cap. Conflict-sweep handoff is disabled for this path.
+
+The manifest pins the existing brain, source incarnation, target identity and
+revision, selected full fact rows (including vectors), existing target fence
+rows and duplicate/withdrawal/visibility outcomes. Apply retains original fact
+IDs, provenance, visibility and vectors; context records the supplied evidence.
+An exact duplicate is explicitly shown as a retirement. Unrepresentable
+precision or normalization, a non-entity target, a withdrawn claim, or any
+unreviewed change is refused. Microsecond timestamps the current JS projection
+cannot represent and existing fence rows that would be rounded are held;
+their values are never silently rewritten.
+This bounded preview currently holds segmented targets and inline compiled
+truth at or over 64 KiB. It never treats a truncated prefix as a whole page.
+
+Keep the original manifest after a lost reply and apply that exact file again:
+its frozen UUID replays the same durable request. Never edit its pins or give
+an uncertain write a new identity. A changed target or fact needs a newly
+reviewed preview, after the original receipt has a known terminal outcome.
+Committed publication and any later effects still need independent readback.
+
 ### Large brains: continue where you stopped
 
 Each run examines `--limit` facts (default 1000), walking by fact id. When more
