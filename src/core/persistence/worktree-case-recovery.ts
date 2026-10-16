@@ -1,7 +1,8 @@
 /** Explicit, preview-bound repair of one ASCII case alias. No generic dirty
  * exemption. Call only while the official refresh and owner locks are held. */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { execFileSync } from 'node:child_process';
+import { execFileSync } from '../spawn.ts';
+import { flushDirectory, flushFile, sameFileMode } from '../fs-durable.ts';
 import { createHash } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative } from 'node:path';
@@ -132,7 +133,7 @@ function validateCasePreviewImpl(root:string,binding:WorktreeBinding,oldHead:str
     if(bytes>512*1024**2||!now.subarray(0,was.length).equals(was)) refuse('old JSONL bytes not retained');
   }
 }
-function syncDir(path:string):void { const fd=openSync(path,'r');try{fsyncSync(fd);}finally{closeSync(fd);} }
+function syncDir(path:string):void { flushDirectory(path); }
 function durable(path:string,data:Buffer|string):void {
   const fd=openSync(path,'wx',0o600);try{writeFileSync(fd,data);fsyncSync(fd);}finally{closeSync(fd);}syncDir(dirname(path));
 }
@@ -165,10 +166,16 @@ async function applyCaseRecoveryImpl(root:string,row:WorktreeRefreshRow,binding:
     }
     durable(join(backup,'physical.bin'),file(physical(root,p.keep)));
     const temporary=join(backup,'transition.index');durable(temporary,original);
-    git(root,['update-index','--force-remove',p.remove],temporary);
+    // On a case-insensitive filesystem both spellings name one directory
+    // entry: removing that entry during merge would remove the kept file too.
+    // Distinct hardlink entries share bytes but Git must remove the old name
+    // through the ordinary fast-forward, so retain its original index entry.
+    if(realpathSync(physical(root,p.keep))===realpathSync(physical(root,p.remove))) {
+      git(root,['update-index','--force-remove',p.remove],temporary);
+    }
     const next=entries(root,row.target_head).find(e=>e.path===p.keep)!;
     git(root,['update-index','--add','--cacheinfo',`${next.mode},${next.oid},${p.keep}`],temporary);
-    const after=file(temporary);const tf=openSync(temporary,'r');try{fsyncSync(tf);}finally{closeSync(tf);}syncDir(backup);
+    const after=file(temporary);flushFile(temporary);syncDir(backup);
     const receipt:CaseRecoveryReceipt={version:1,preview:p,backupDir:backup,originalIndexSha256:digest(original),transitionIndexSha256:digest(after)};
     durable(join(backup,'prepared.json'),JSON.stringify(receipt));
     await save(receipt);
@@ -195,7 +202,13 @@ function reconcileCaseRecoveryImpl(root:string,row:WorktreeRefreshRow,head:strin
     // No old-index restore is allowed once HEAD reached the target.
     for(const e of entries(root,row.target_head)) {
       const materialized=physical(root,e.path);
-      if(!file(materialized).equals(blob(root,e.oid)) || Boolean(statSync(materialized).mode & 0o111)!==(e.mode==='100755')) refuse('target materialization or mode differs');
+      const mode=statSync(materialized).mode;
+      // Windows exposes the read-only attribute, not POSIX executable bits.
+      // The exact Git executable mode is already verified in the target index.
+      const modeMatches=process.platform==='win32'
+        ? sameFileMode(mode,Number.parseInt(e.mode,8))
+        : Boolean(mode & 0o111)===(e.mode==='100755');
+      if(!file(materialized).equals(blob(root,e.oid)) || !modeMatches) refuse('target materialization or mode differs');
     }
     const status=fields(git(root,['status','--porcelain=v1','-z','--untracked-files=normal']));
     for(let i=0;i<status.length;i++) {

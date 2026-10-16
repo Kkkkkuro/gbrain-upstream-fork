@@ -2,7 +2,7 @@
  * in-memory PGLite; never a production checkout or provider. */
 import {afterAll,beforeAll,expect,test} from 'bun:test';
 import {execFileSync,spawnSync} from 'node:child_process';
-import {chmodSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
+import {chmodSync,existsSync,linkSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {withEnv} from './helpers/with-env.ts';
@@ -29,14 +29,23 @@ const c=Buffer.from('# Historical report\nAll original bytes.\n');
 async function setup(f:RefreshFixture):Promise<CaseRecoveryPreview> {
  const blobs=[a,b,c].map(data=>g(f.upstream,['hash-object','-w','--stdin'],data).toString().trim());
  for(const [i,path] of [keep,remove,report].entries())g(f.upstream,['update-index','--add','--cacheinfo',`100644,${blobs[i]},${path}`]);
+ const executable=Buffer.from('#!/bin/sh\nexit 0\n');
+ const executableOid=g(f.upstream,['hash-object','-w','--stdin'],executable).toString().trim();
+ g(f.upstream,['update-index','--add','--cacheinfo',`100755,${executableOid},retained-tool.sh`]);
  g(f.upstream,['commit','-qm','old divergent aliases']);g(f.upstream,['push','-q','origin','main']);
  g(f.root,['fetch','-q','origin']);
  // Establish the synthetic original state without relying on clone checkout's
  // alias order. This is fixture setup, not the candidate recovery path.
  const old=g(f.upstream,['rev-parse','HEAD']).toString().trim();
  g(f.root,['read-tree',old]);g(f.root,['update-ref','HEAD',old]);
+ writeFileSync(join(f.root,'retained-tool.sh'),executable);chmodSync(join(f.root,'retained-tool.sh'),0o755);
  mkdirSync(join(f.root,keep,'..'),{recursive:true});writeFileSync(join(f.root,keep),b);
  mkdirSync(join(f.root,report,'..'),{recursive:true});writeFileSync(join(f.root,report),c);
+ // Native case-insensitive aliases already resolve. On a case-sensitive
+ // filesystem, native hardlinks exercise the same inode-bound contract.
+ if(!existsSync(join(f.root,remove))) {
+  mkdirSync(join(f.root,remove,'..'),{recursive:true});linkSync(join(f.root,keep),join(f.root,remove));
+ }
  expect(readFileSync(join(f.root,remove))).toEqual(b);
  const idx=join(f.dir,'target.index');writeFileSync(idx,readFileSync(join(f.upstream,'.git/index')));
  g(f.upstream,['update-index','--force-remove',remove,report],undefined,idx);
@@ -103,7 +112,7 @@ test('unknown post-transition index keeps recovery fenced rather than aborting o
 test('target HEAD with only a mode change refuses recovery and retains the fence',()=>withRefreshFixture(engine,async f=>{
  const p=await setup(f);
  await expect(refreshWorktree(engine,f.alpha,{caseRecovery:p,hooks:{boundary(point){if(point==='merged')throw new Error('after merge');}}})).rejects.toThrow('after merge');
- await disposePersistenceConsumer(engine);chmodSync(join(f.root,keep),0o755);
+ await disposePersistenceConsumer(engine);chmodSync(join(f.root,keep),process.platform==='win32'?0o444:0o755);
  await errorCode(refreshWorktree(engine,f.alpha,{resume:true}),'refresh_recovery_required');
  expect((await f.refreshRows())[0].state).toBe('fenced');expect(f.head()).toBe(p.targetHead);
 }),120000);
