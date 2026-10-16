@@ -188,6 +188,26 @@ More: [docs/guides/in-agent-setup.md#6-back-up-the-complete-local-database](../.
 
 More: [docs/guides/in-agent-setup.md#large-or-non-standard-brains-quiesced-physical-copy](../../docs/guides/in-agent-setup.md#large-or-non-standard-brains-quiesced-physical-copy)
 
+### belief_coverage_required
+
+<a id="belief_coverage_required"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The belief ledger is not enabled on this source, so it has no coverage start to work from. | The history backfill seeds events before the source's coverage start; with no coverage there is no cut to backfill before. | Ask the user, then run `gbrain beliefs enable --source <id>` first. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/designs/BELIEF_LEDGER.md#72-the-marked-history-backfill](../../docs/designs/BELIEF_LEDGER.md#72-the-marked-history-backfill)
+
+### belief_stale_preparation
+
+<a id="belief_stale_preparation"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A purge ran in the source after a belief ledger payload was prepared, so the append was refused. | A payload prepared outside its appending transaction records the source's purge epoch; appending it after a purge could write the purged text back into history. | Run the same command again; it prepares the payload from the current, redacted state. | agent | `repeat the read that failed` | 1 | yes |
+
+More: [docs/designs/BELIEF_LEDGER.md#65-purge-removal-from-active-memory-never-a-physical-erasure-promise](../../docs/designs/BELIEF_LEDGER.md#65-purge-removal-from-active-memory-never-a-physical-erasure-promise)
+
 ### benchmark_duplicate_task_id
 
 <a id="benchmark_duplicate_task_id"></a>
@@ -640,7 +660,9 @@ More: [docs/guides/write-refusals.md#drain-connection-lost](../../docs/guides/wr
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| The connector credential resolves to a different account than the source is pinned to. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+| The connector credential resolves to a different account than the source is pinned to. | A connector source is pinned to the account it first synced, so a swapped credential can never import another account's mail, calendar or repositories into it. The refused run records the mismatch, and autopilot skips the source (unavailable-path) instead of retrying it every interval (#6803). | Restore the credential for the pinned account and run gbrain sync --source <id> (it clears the skip once the account check passes), or add a new source for the new account and archive this one with gbrain sources archive <id>. gbrain doctor --only connector_account_mismatch lists every affected source. Run: gbrain doctor --only connector_account_mismatch --json | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/write-refusals.md#connector-account-changed](../../docs/guides/write-refusals.md#connector-account-changed)
 
 ### connector_fence_below_timeline
 
@@ -792,6 +814,26 @@ More: [docs/guides/core-memory.md#remote-edits](../../docs/guides/core-memory.md
 |---|---|---|---|---|---|---|
 | Cost preview requires yes. | The step needs the user's decision before it runs. | Stop and ask the user; re-run only with the authorization the message names. | user | `repeat the read that failed` | 1 | no |
 
+### coverage_from
+
+<a id="coverage_from"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The belief ledger does not cover that time for this page or source: it starts at the page's baseline cut or the source's watermark. | Recorded history exists only from a page's baseline (or creation) after the ledger was enabled; earlier times are unknown, not empty. | Ask about a time at or after the `from` time, or run `gbrain beliefs backfill --source <id>` for best-effort history before it. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/designs/BELIEF_LEDGER.md#71-activation-baseline-and-the-watermark](../../docs/designs/BELIEF_LEDGER.md#71-activation-baseline-and-the-watermark)
+
+### coverage_gap
+
+<a id="coverage_gap"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The belief ledger was not recording at that time: coverage was stopped, or a backup restore left a gap between the archive's time and the restore. | The request itself was wrong or no longer matches the brain; nothing was changed. | Ask about a time outside the gap; `gbrain beliefs status --source <id>` lists the intervals and gaps. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/designs/BELIEF_LEDGER.md#71-activation-baseline-and-the-watermark](../../docs/designs/BELIEF_LEDGER.md#71-activation-baseline-and-the-watermark)
+
 ### cursor_incarnation_retired
 
 <a id="cursor_incarnation_retired"></a>
@@ -924,7 +966,7 @@ More: [docs/guides/troubleshooting.md#doctor-ops-tier](../../docs/guides/trouble
 |---|---|---|---|---|---|---|
 | A managed sync drain stopped `blocked` because its head write made no progress (no committed receipt and no step advance) for the whole stall window. | A renewed lease is not progress: the detector keys on the head claim's phase and step. With a live owner on this host the drain prints `stalled <N>s on <step>` from the allowance (budget plus 30 s) and keeps going; it stops only when `persistence.preparation_ceiling_ms` passes without the root being released, or when that owner's heartbeat row reads wedged (`cause: owner_wedged_here`, with the owner's kind, pid and nonce and `retry_after_ms` to the ceiling, after which the owner frees the root and the next pass holds the entry). A lapsed claim (`owner_missing`) stops at once unless this host owns the checkout and a live full consumer can reclaim it, which gets one more window. `drain.stall.cause` names which. | Inspect the writer with gbrain sources writer status --source <id> --json (read-only: the owner process, its step and what it waits on, and the next action). Before the ceiling (`next.safe_to_loop` true) rerun next.command after retry_after_ms; past it, or with a wedged owner, restart the named owner process on the brain host and rerun the same sync. Run: gbrain sources writer status --source '{source_id}' --json | host_admin | `gbrain doctor --only managed_sync_not_moving --json` | 1 | no |
 
-Reasons: `owner_wedged_here`, `owner_missing`, `preparation_overdue`, `publication_overdue`, `no_progress`, `no_admission`.
+Reasons: `owner_wedged_here`, `owner_missing`, `preparation_overdue`, `publication_overdue`, `no_progress`.
 
 More: [docs/guides/write-refusals.md#drain-stalled](../../docs/guides/write-refusals.md#drain-stalled)
 
@@ -945,6 +987,16 @@ More: [docs/operations/spend-controls.md#dream-paid-loop-breaker-dreambreakermax
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Only a failed, non-running embedding effect can be explicitly retried. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### embed_backfill_stalled
+
+<a id="embed_backfill_stalled"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A source's automatic embed-backfill failed the same way several times with nothing embedded, so automatic backfill for it backs off and then stops. | The only remaining work sits on pages whose text projection cannot be rebuilt (a rebuild_failed projection, or an image page only its importer rebuilds). Each identical run spent a worker slot and dead-lettered; after three, automatic submission stops until the blocked pages or the stale chunks change, or a run embeds something (#6803). Explicit gbrain embed --stale and gbrain jobs submit embed-backfill are not gated. | Run gbrain doctor --only embed_backfill_stalled to see the blocked pages, preview the repair with gbrain projections drain --dry-run, then run gbrain projections drain; it names each page that still fails and its next step. Run: gbrain doctor --only embed_backfill_stalled --json | agent | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/repair.md#embed-backfill-stalled](../../docs/guides/repair.md#embed-backfill-stalled)
 
 ### embedding_auth_failed
 
@@ -2326,7 +2378,7 @@ More: [docs/guides/windowed-reads.md#page_too_large_for_inline](../../docs/guide
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A file whose exact bytes imported before is now refused by gbrain's frontmatter reader. | The same bytes imported under an earlier gbrain version, so only gbrain changed; with `sync.parser_regression=hold` such a file is held and the rest of the sync continues. | Report it as a gbrain bug with the gbrain version, the file and the code; upgrade or pin the last good version, then sync again with --retry-failed. | host_admin | `gbrain doctor --json` | 1 | no |
+| A file whose exact bytes imported before is now refused by gbrain's frontmatter reader. | The same bytes imported under an earlier gbrain version, so only gbrain changed; with `GBRAIN_SYNC_PARSER_REGRESSION=hold` for the process that syncs, such a file is held and the rest of the sync continues. | Report it as a gbrain bug with the gbrain version, the file and the code; upgrade or pin the last good version, then sync again with --retry-failed. | host_admin | `gbrain doctor --json` | 1 | no |
 
 ### pasted_wrong_url
 
@@ -2595,6 +2647,16 @@ More: [docs/guides/memory-boundaries.md#purge](../../docs/guides/memory-boundari
 | A page purge's in-transaction journal lookup hit the publication transaction's statement budget, so the purge failed terminally; nothing was removed, tombstoned or redacted, and later writes to the source move again. | The lookup is deterministic on a large request table, not contention: retrying it as `database_contention` requeued the same purge forever and held every later write to its source behind it. The substring search for the page's claims now runs at preparation under the preparation budget; this code is for the lookups that still run inside the transaction (the slug lookup, the tail and pending re-checks, the locking read). | Do not assume the requested content was erased. If the receipt names the slug index as missing or INVALID, run gbrain repair request-indexes --apply first; then submit the purge again with a new request_id (a retry with the same id returns this failure). Run: gbrain repair request-indexes --json | host_admin | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/write-refusals.md#purge_lookup_timeout](../../docs/guides/write-refusals.md#purge_lookup_timeout)
+
+### purge_mirror_unwritable
+
+<a id="purge_mirror_unwritable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A purge could not append its intent line to the purge mirror (<brain home>/.gbrain/purge-events.jsonl), so it was refused; nothing was removed, tombstoned or redacted. | Restore replays the purges recorded in that text-free mirror; a purge that committed without its line would come back silently from an older backup. | Do not assume the requested content was erased. Make the mirror a writable regular file owned by the brain's user (mode 0600), then run the purge again with a new request_id. | host_admin | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/write-refusals.md#purge_mirror_unwritable](../../docs/guides/write-refusals.md#purge_mirror_unwritable)
 
 ### purged_content
 

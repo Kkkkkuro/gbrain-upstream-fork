@@ -642,7 +642,8 @@
               "count": 0,
               "docs": "docs/guides/troubleshooting.md#managed-sync-not-moving",
               "parked": 0,
-              "sources": []
+              "sources": [],
+              "stranded": 0
             },
             "elapsed_ms": "<volatile>",
             "message": "No managed sync is pending.",
@@ -667,6 +668,39 @@
             "elapsed_ms": "<volatile>",
             "message": "Receipt compaction last ran 0 hour(s) ago (compacted 0, freed 0 bytes).",
             "name": "persistence_compaction",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "by_day": [
+                {
+                  "content_decisions": 0,
+                  "day": "2026-10-10",
+                  "interventions": 1
+                }
+              ],
+              "content_decisions": {
+                "file_drift_apply": 0,
+                "file_drift_hold": 0,
+                "total": 0
+              },
+              "docs": "docs/guides/sync-unblock-runbook.md#soak-counters",
+              "interventions": {
+                "needs_human": 1,
+                "repair_apply": 0,
+                "retry_held": 0,
+                "sync_non_plain": 0,
+                "total": 1,
+                "unblock_apply": 0
+              },
+              "since": "<ts>",
+              "window_days": 7
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Last 7 days: 1 managed-sync intervention(s) (needs_human 1), 0 content decision(s).",
+            "name": "sync_soak_counters",
+            "severity": "info",
             "status": "ok"
           },
           {
@@ -931,7 +965,7 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1191 column(s) verified against live schema",
+            "message": "1243 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
@@ -2053,6 +2087,20 @@
           },
           {
             "category": "ops",
+            "elapsed_ms": "<volatile>",
+            "message": "No automatic embed-backfill is repeating the same failure.",
+            "name": "embed_backfill_stalled",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "elapsed_ms": "<volatile>",
+            "message": "No connector source is waiting for its account to be repinned.",
+            "name": "connector_account_mismatch",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
             "details": {
               "active_ids": [],
               "authorizable": {},
@@ -2661,6 +2709,7 @@
                 "timeline_entries"
               ],
               "engine": "pglite",
+              "expression_indexes_without_statistics": [],
               "fix": "gbrain repair planner-stats --apply",
               "missing_search_statistics": [],
               "stale": []
@@ -2701,6 +2750,45 @@
             "elapsed_ms": "<volatile>",
             "message": "Every page has its revision; the page revision backfill is complete.",
             "name": "revision_backfill",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "beliefs",
+                "enable",
+                "--source",
+                "default",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain beliefs enable --source default --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/designs/BELIEF_LEDGER.md#73-the-doctor-coverage-check",
+              "next": "ask_user",
+              "requires_exclusive": false,
+              "user_message": "Do you want gbrain to keep a belief ledger (a recorded history of facts, takes and links) for this source?",
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "belief_ledger_coverage",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Enabling baselines every page of the source and records each later change; only a managed source is certified."
+            },
+            "message": "The belief ledger is off: no source records what this brain had recorded, and when.",
+            "name": "belief_ledger_coverage",
+            "readiness_state": "disabled_by_choice",
+            "severity": "info",
             "status": "ok"
           },
           {
@@ -2931,6 +3019,17 @@
             "name": "missing_recorded_files",
             "readiness_state": "not_applicable",
             "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "meta",
+            "details": {
+              "rollback": [],
+              "unapplied": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No retired sync config key is stored on this brain.",
+            "name": "sync_config_keys",
             "status": "ok"
           },
           {
@@ -4460,7 +4559,8 @@
               "count": 0,
               "docs": "docs/guides/troubleshooting.md#managed-sync-not-moving",
               "parked": 0,
-              "sources": []
+              "sources": [],
+              "stranded": 0
             },
             "elapsed_ms": "<volatile>",
             "message": "No managed sync is pending.",
@@ -4485,6 +4585,39 @@
             "elapsed_ms": "<volatile>",
             "message": "Receipt compaction last ran 0 hour(s) ago (compacted 0, freed 0 bytes).",
             "name": "persistence_compaction",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "by_day": [
+                {
+                  "content_decisions": 0,
+                  "day": "2026-10-10",
+                  "interventions": 1
+                }
+              ],
+              "content_decisions": {
+                "file_drift_apply": 0,
+                "file_drift_hold": 0,
+                "total": 0
+              },
+              "docs": "docs/guides/sync-unblock-runbook.md#soak-counters",
+              "interventions": {
+                "needs_human": 1,
+                "repair_apply": 0,
+                "retry_held": 0,
+                "sync_non_plain": 0,
+                "total": 1,
+                "unblock_apply": 0
+              },
+              "since": "<ts>",
+              "window_days": 7
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "Last 7 days: 1 managed-sync intervention(s) (needs_human 1), 0 content decision(s).",
+            "name": "sync_soak_counters",
+            "severity": "info",
             "status": "ok"
           },
           {
@@ -4749,7 +4882,7 @@
           {
             "category": "meta",
             "elapsed_ms": "<volatile>",
-            "message": "1191 column(s) verified against live schema",
+            "message": "1243 column(s) verified against live schema",
             "name": "schema_columns",
             "status": "ok"
           },
@@ -5871,6 +6004,20 @@
           },
           {
             "category": "ops",
+            "elapsed_ms": "<volatile>",
+            "message": "No automatic embed-backfill is repeating the same failure.",
+            "name": "embed_backfill_stalled",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "elapsed_ms": "<volatile>",
+            "message": "No connector source is waiting for its account to be repinned.",
+            "name": "connector_account_mismatch",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
             "details": {
               "active_ids": [],
               "authorizable": {},
@@ -6479,6 +6626,7 @@
                 "timeline_entries"
               ],
               "engine": "pglite",
+              "expression_indexes_without_statistics": [],
               "fix": "gbrain repair planner-stats --apply",
               "missing_search_statistics": [],
               "stale": []
@@ -6519,6 +6667,45 @@
             "elapsed_ms": "<volatile>",
             "message": "Every page has its revision; the page revision backfill is complete.",
             "name": "revision_backfill",
+            "status": "ok"
+          },
+          {
+            "category": "brain",
+            "elapsed_ms": "<volatile>",
+            "fix": {
+              "actor": "agent",
+              "argv": [
+                "gbrain",
+                "beliefs",
+                "enable",
+                "--source",
+                "default",
+                "--brain",
+                "host"
+              ],
+              "command": "gbrain beliefs enable --source default --brain host",
+              "consent": [],
+              "docs": "https://github.com/garrytan/gbrain/blob/master/docs/designs/BELIEF_LEDGER.md#73-the-doctor-coverage-check",
+              "next": "ask_user",
+              "requires_exclusive": false,
+              "user_message": "Do you want gbrain to keep a belief ledger (a recorded history of facts, takes and links) for this source?",
+              "verify": {
+                "argv": [
+                  "gbrain",
+                  "doctor",
+                  "--only",
+                  "belief_ledger_coverage",
+                  "--json",
+                  "--brain",
+                  "host"
+                ]
+              },
+              "why": "Enabling baselines every page of the source and records each later change; only a managed source is certified."
+            },
+            "message": "The belief ledger is off: no source records what this brain had recorded, and when.",
+            "name": "belief_ledger_coverage",
+            "readiness_state": "disabled_by_choice",
+            "severity": "info",
             "status": "ok"
           },
           {
@@ -6749,6 +6936,17 @@
             "name": "missing_recorded_files",
             "readiness_state": "not_applicable",
             "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "meta",
+            "details": {
+              "rollback": [],
+              "unapplied": []
+            },
+            "elapsed_ms": "<volatile>",
+            "message": "No retired sync config key is stored on this brain.",
+            "name": "sync_config_keys",
             "status": "ok"
           },
           {

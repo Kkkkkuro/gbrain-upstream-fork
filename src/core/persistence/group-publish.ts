@@ -72,6 +72,8 @@ import { assertMutationProtocol } from './protocol.ts';
 import { writeSwitchOn } from './switches.ts';
 import { importGroupReads, type ImportGroupReads } from './import-reads.ts';
 import { withScreeningPaths } from './screening-paths.ts';
+import { publicationBeliefOptions, withBeliefBatch } from '../belief/ledger.ts';
+import { markBeliefCommits } from '../belief/append.ts';
 
 /** A `put_pages` or managed import group publishes at most this many pages per transaction, so one commit stays a few seconds long. */
 export const PAGE_BATCH_GROUP_MAX = 8;
@@ -211,6 +213,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
   hooks: GroupHooks = {}, lane: LaneState | null = null, transaction: TransactionRunner = fn => publicationTransaction(engine, fn)): Promise<GroupPublication> {
   const head = rows[0];
   const none: GroupPublication = { done: null, requeued: [] };
+  const beliefReport = { appended: 0 };
   // #6712: the member whose own check or write refused inside the transaction, so a lane group can settle that page alone.
   const memberOf = new WeakMap<object, number>();
   const tag = (error: unknown, i: number) => { if (error && typeof error === 'object' && !memberOf.has(error)) memberOf.set(error, i); return error; };
@@ -347,7 +350,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
               if (attribute) await setMemberAttribution(tx, publicationAttribution(row, member.trust));
             }
             member.postimage = undefined;
-            const outcome = await member.apply(tx, snapshot);
+            const outcome = await withBeliefBatch(tx, publicationBeliefOptions(row, member.additionalPageKeys, beliefReport), () => member.apply(tx, snapshot));
             await classifyUnboundPage(tx, row);
             if (member.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
             const final = await publicationPostimage(tx, row, member);
@@ -372,6 +375,8 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
       return done;
     });
     committed = true;
+    // One post-commit observation for every member (docs/designs/BELIEF_LEDGER.md 5.3).
+    if (beliefReport.appended) await markBeliefCommits(engine, done.map(row => row.id)).catch(() => undefined);
     for (const row of done) await seam('after_commit', row);
     hooks.committed?.(done);
     if (recorded.size) {
@@ -651,7 +656,7 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
           // The member's signal reaches its preparer through its clock (enterClaimStep), never as a blanket statement signal: see the memo rule.
           const prep = startPreparation(async signal => {
             signal.addEventListener('abort', () => cancels[offset]!.abort(signal.reason), { once: true });
-            await faultPoint('consumer:preparing', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation, signal });
+            await faultPoint('consumer:preparing', { requestId: row.request_id, writeId: row.id, sourceId: row.source_id, operation: row.operation, signal });
             return run.prepare(row, reads, undefined, clocks[i]);
           }, budget, { onDeadline: () => {
             if (!ordered) return;

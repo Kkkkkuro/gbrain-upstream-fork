@@ -35,7 +35,7 @@ import { readOnlyCatalogPackSourceIds } from '../../../core/shared-skills/adopte
 import { connectorAuthorities } from '../../../core/persistence/connector-authority.ts';
 import { parseSourceConfig } from '../../../core/sources-load.ts';
 import { checkError } from '../check-fix.ts';
-import { firstSyncRunning, noSuccessfulSync, type SyncOutcomeEntry } from '../sync-outcome.ts';
+import { checkpointMovedFix, firstSyncRunning, noSuccessfulSync, stoppedConnectorIssues, type SyncOutcomeEntry } from '../sync-outcome.ts';
 import { haltReasonsWithUnknown, readRecordedHaltReasons7d, topHaltReason } from '../../../core/extract/rollup-writer.ts';
 
 /** Local aliases; the shared warn-once memo lives in core so it can't fork per module. */
@@ -1259,8 +1259,7 @@ export async function checkSyncFreshness(
     catch (error) { if (!isOwnedContentSchemaMissing(error)) throw error; }
     // #6076: an adopted read-only catalog pack (no commit history) has nothing to sync.
     const catalogPacks = await readOnlyCatalogPackSourceIds(engine, sources, localOnly);
-    let writer_owned_count = 0;
-    let read_only_pack_count = 0;
+    let writer_owned_count = 0, read_only_pack_count = 0;
     // v0.41.27.0: D6 count math. Every source falls into
     // EXACTLY ONE bucket per iteration. Invariant pinned by unit test:
     //   unchanged + synced_recently + stale + writer_owned + read_only_pack counts === sources.length
@@ -1269,8 +1268,7 @@ export async function checkSyncFreshness(
     let unchanged_count = 0;
     let synced_recently_count = 0;
     let stale_count = 0;
-    let hasWarnings = false;
-    let hasFailures = false;
+    let hasWarnings = false, hasFailures = false;
 
     // BUG 4 (v0.42.x): a source with a LIVE, non-expired per-source sync lock is
     // actively syncing RIGHT NOW — it must not read as stale or never-synced.
@@ -1312,8 +1310,9 @@ export async function checkSyncFreshness(
     const stalenessCeilingSeconds = resolveStalenessCeilingSeconds();
     let managed = false;
     try { managed = await persistenceEnabledForHealth(engine); } catch { /* pre-persistence brain */ }
-    let upstream_unknown_count = 0;
-    let upstream_behind_count = 0;
+    let upstream_unknown_count = 0, upstream_behind_count = 0;
+    const staleIds: string[] = [];
+    const stoppedConnectors = await stoppedConnectorIssues(engine, sources, now - failMs).catch(() => new Map());
     for (const source of sources) {
       if (ownedContent.has(source.id)) { writer_owned_count++; continue; }
       if (catalogPacks.ids.has(source.id)) { read_only_pack_count++; continue; }
@@ -1370,6 +1369,8 @@ export async function checkSyncFreshness(
         continue;
       }
 
+      const stopped = stoppedConnectors.get(source.id);
+      if (stopped) { issues.push(stopped.issue); stale_count++; hasFailures ||= stopped.fail; hasWarnings ||= !stopped.fail; continue; }
       if (!source.last_sync_at) {
         const never = await noSuccessfulSync(engine, source.id, display, managed);
         issues.push(never.issue); outcomes.push(never.entry);
@@ -1467,11 +1468,11 @@ export async function checkSyncFreshness(
       if (thresholdAgeMs > failMs) {
         issues.push(`Source ${display} last synced ${ageDays}d ago — brain search is stale!`);
         hasFailures = true;
-        stale_count++;
+        stale_count++; staleIds.push(source.id);
       } else if (thresholdAgeMs > warnMs) {
         issues.push(`Source ${display} last synced ${ageHours}h ago`);
         hasWarnings = true;
-        stale_count++;
+        stale_count++; staleIds.push(source.id);
       } else {
         synced_recently_count++;
       }
@@ -1489,20 +1490,13 @@ export async function checkSyncFreshness(
       + (read_only_pack_count ? `. ${read_only_pack_count} read-only skill-pack source(s): no commits to sync` : '') + (catalogPacks.note ? `. ${catalogPacks.note}` : '');
 
     const remedy = issues.length > outcomes.length;
-    const outcomeFix = outcomes.find(o => o.code === 'sync_no_successful_sync')?.fix ?? outcomes[0]?.fix;
-    if (hasFailures) {
+    const moved = managed && localOnly && staleIds.length ? await checkpointMovedFix(engine, staleIds) : null;
+    const outcomeFix = outcomes.find(o => o.code === 'sync_no_successful_sync')?.fix ?? outcomes[0]?.fix ?? moved?.fix;
+    if (hasFailures || hasWarnings) {
       return {
         name: 'sync_freshness',
-        status: 'fail',
-        message: `${issues.join('; ')}${remedy ? `. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` for each stale source` : ''}${inProgressNote}`,
-        details, ...(outcomeFix ? { fix: outcomeFix } : {}),
-      };
-    }
-    if (hasWarnings) {
-      return {
-        name: 'sync_freshness',
-        status: 'warn',
-        message: `${issues.join('; ')}${remedy ? `. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` to refresh` : ''}${inProgressNote}`,
+        status: hasFailures ? 'fail' : 'warn',
+        message: `${issues.join('; ')}${remedy ? `. Run \`gbrain sync --source <id>${managed ? ' --no-pull' : ''}\` ${hasFailures ? 'for each stale source' : 'to refresh'}` : ''}${moved?.note ?? ''}${inProgressNote}`,
         details, ...(outcomeFix ? { fix: outcomeFix } : {}),
       };
     }

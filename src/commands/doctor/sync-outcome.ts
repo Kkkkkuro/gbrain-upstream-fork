@@ -8,7 +8,8 @@
 import type { Action } from '../../core/agent-output.ts';
 import type { BrainEngine } from '../../core/engine.ts';
 import { readLastSyncAttempt, type SyncAttemptState } from '../../core/sync-attempt.ts';
-import { doctorVerify } from './check-fix.ts';
+import { classifyManagedSyncOrphans } from '../../core/persistence/managed-sync-orphans.ts';
+import { agentFix, doctorVerify } from './check-fix.ts';
 
 export interface SyncOutcomeEntry {
   source_id: string;
@@ -60,4 +61,39 @@ export async function noSuccessfulSync(engine: BrainEngine, sourceId: string, di
     entry: { source_id: sourceId, code: 'sync_no_successful_sync', reason: attempt.state, last_attempt_at: attempt.last_attempt_at, result: attempt.result,
       held: attempt.held, job_id: attempt.job_id, fix },
   };
+}
+
+/**
+ * #6831: sync_freshness's verdict for each Google or GitHub connector source whose last CONNECTOR_STOPPED_RUNS or more
+ * runs ended on an error. Such a source imports nothing, but its last_sync_at can still look recent, so freshness alone
+ * reads it as healthy. The line names the error, the item and the read-only next step; it is a failure once the source's
+ * last successful sync is older than `failBeforeMs` (sync_freshness's fail age), a warning before that.
+ */
+export async function stoppedConnectorIssues(engine: BrainEngine, sources: Array<{ id: string; last_sync_at: string | Date | null }>,
+  failBeforeMs: number): Promise<Map<string, { issue: string; fail: boolean }>> {
+  const { readConnectorLastError } = await import('../../core/persistence/connector-status.ts');
+  const issues = new Map<string, { issue: string; fail: boolean }>();
+  for (const source of sources) {
+    const failure = await readConnectorLastError(engine, source.id);
+    if (!failure?.stopped) continue;
+    issues.set(source.id, { fail: !source.last_sync_at || new Date(source.last_sync_at).getTime() < failBeforeMs,
+      issue: `Source '${source.id}' is STOPPED: its last ${failure.consecutive} connector syncs ended on ${failure.code}${failure.slug ? ` at ${failure.slug}` : ''} `
+        + `(last ${failure.at.slice(0, 16).replace('T', ' ')}), so nothing from it is imported; inspect with \`${failure.fix.argv!.join(' ')}\`` });
+  }
+  return issues;
+}
+
+/**
+ * #6834: the fix for stale managed sources whose unfinished cursor no sync can publish (its checkpoint lost to a
+ * `last_commit` that moved outside the run): `gbrain repair managed-sync-orphans` retires it, so the remedy is the
+ * preview, not another sync. Null when none of them has a `checkpoint_moved` cursor or the read fails.
+ */
+export async function checkpointMovedFix(engine: BrainEngine, staleIds: string[]): Promise<{ fix: Action; note: string } | null> {
+  const moved = (await classifyManagedSyncOrphans(engine, staleIds).catch(() => ({ orphans: [] }))).orphans.filter(orphan => orphan.reason === 'checkpoint_moved');
+  if (!moved.length) return null;
+  const ids = [...new Set(moved.map(orphan => orphan.source_id))];
+  const fix = agentFix(['gbrain', 'repair', 'managed-sync-orphans', ...(ids.length === 1 ? ['--source', ids[0]!] : [])],
+    `The unfinished sync of ${ids.join(', ')} can never checkpoint (its source's last_commit moved outside the run), so a plain sync stays blocked. The preview lists the cursor and prints the apply command with its hash; writes nothing.`,
+    'sync_freshness', { docs: 'docs/guides/repair.md#managed-sync-orphans' });
+  return { fix, note: `. ${fix.why} Run \`${fix.argv!.join(' ')}\`` };
 }

@@ -78,6 +78,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'safe_index_pending',
   'self_capture',
   'brain_score',
+  // W1: belief ledger coverage intervals, drift, orphan lifetimes and unsafe restores.
+  'belief_ledger_coverage',
   'calibration_freshness',
   'child_table_orphans',
   'chronicle_projection_health',
@@ -272,6 +274,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'orphan_clones',
   'persistence_capacity',
   'persistence_compaction',
+  // #6712 PR 2: the managed-sync soak counters (interventions, content decisions), informational.
+  'sync_soak_counters',
   'persistence_counter_drift',
   'worktree_refresh_stuck',
   'managed_guard_schema_drift',
@@ -314,6 +318,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'queue_health',
   // #4578: brain-wide maintenance jobs dying at their deadline.
   'global_maintenance_timeouts',
+  'embed_backfill_stalled',
+  'connector_account_mismatch',
   // #5157: queued jobs from before the v0.50 authority cutover block every worker.
   'legacy_job_authority',
   // F3: legacy tokens on the JSONB-only grant shape (info) and grant drift (warn).
@@ -374,6 +380,8 @@ export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   'schema_pack_source_drift',
   'schema_version',
   'slug_fallback_audit',
+  // #6712 PR 2: retired sync.* keys stored on the brain and no longer applied.
+  'sync_config_keys',
   'timeline_dedup_index',
   'type_proliferation',
   'upgrade_errors',
