@@ -33,6 +33,7 @@ There is no schema migration, automatic proof inference, new permission or Docto
 
 ### Itemized changes
 
+- Preserve completed and resumable trust-scan coverage during temporary-checkpoint GC, so the same detector does not report legacy rows as unscanned again after seven days. See [recurrence and recovery](docs/guides/trust-scan-checkpoint-retention.md); lost coverage still requires the owner's real scan.
 - Record already-current refresh observations after pending member imports and retain the already-synced shortcut.
 - Share exact control equivalence across Doctor, discovery/count and stale-atom retirement, with canonical body bounds and consuming-statement path, revision and ledger checks.
 - Add cross-engine regressions and register the PostgreSQL arm. Document the bounded inline readers and the exact consumer-module growth for review.
