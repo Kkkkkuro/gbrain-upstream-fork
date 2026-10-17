@@ -511,6 +511,9 @@ export async function purgeStaleCheckpoints(
       `WITH deleted AS (
          DELETE FROM op_checkpoints
          WHERE updated_at < now() - ($1 || ' days')::interval
+           -- This singleton is durable scan coverage, including unfinished progress.
+           -- Deleting it makes the current detector forget a completed legacy scan.
+           AND op<>'trust_scan'
            AND op NOT IN ('managed-atoms','managed-atoms-generation','managed-connector','managed-connector-retry','managed-connector-state','managed-connector-migration')
            AND op<>'connector-hold-retry'
            AND op<>'stuck-recovery-resolution'
