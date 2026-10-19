@@ -9,7 +9,7 @@ import { runPhaseConsolidate } from '../src/core/cycle/phases/consolidate.ts';
 import { runPhaseSynthesize } from '../src/core/cycle/synthesize.ts';
 import { runPhasePatterns } from '../src/core/cycle/patterns.ts';
 import { runCycle } from '../src/core/cycle.ts';
-import { maintenancePreflight, publishMaintenancePage, prepareMaintenanceMutation } from '../src/core/persistence/prepared-maintenance.ts';
+import { maintenancePreflight, publishMaintenancePage, prepareMaintenanceMutation, submitMaintenanceConsolidation } from '../src/core/persistence/prepared-maintenance.ts';
 import { claimWorktree, getWorktreeBinding, acquireWorktree } from '../src/core/persistence/ownership.ts';
 import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer, startPersistenceConsumer } from '../src/core/persistence/service.ts';
@@ -26,6 +26,7 @@ import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { withSubmissionAuthority } from '../src/core/minions/submission-authority.ts';
 import type { WriteRequest } from '../src/core/persistence/model.ts';
+import { validateConsolidationTimeSnapshot } from '../src/core/facts/consolidation-time.ts';
 import { testBackends } from './helpers/test-backends.ts';
 import { rawProvenanceCheck } from '../src/commands/doctor/checks/core-health.ts';
 import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
@@ -103,6 +104,163 @@ async function seedFacts(engine: BrainEngine, sourceId: string, slug: string, vi
       VALUES($1,$2,$3,'fact','test',$4,$5,$6::timestamptz,$7::vector,'openai:text-embedding-3-large',md5($3))`,
     [sourceId, slug, `Example claim ${WORDS[i]}`, visibility, 0.9 - i / 10, `2026-01-0${i + 1}T00:00:00Z`, vector]);
   }
+}
+
+// #6023: a confidence score cannot establish chronology between typed
+// observations at the same instant. Keep both facts until chronology is known.
+async function seedTypedTimeTie(engine: BrainEngine, sourceId: string) {
+  await seed(engine, sourceId);
+  const rows = await engine.executeRaw<{ id: number }>('SELECT id FROM facts WHERE source_id=$1 ORDER BY id', [sourceId]);
+  for (const [i, text, value, confidence] of [
+    [0, 'The deposit was initially reported as $100,000.', 100000, 1],
+    [1, 'Correction: the deposit is $82,000, replacing the initial $100,000.', 82000, 0.9],
+  ] as const) {
+    await engine.executeRaw(`UPDATE facts SET fact=$2, embedded_text_hash=md5($2), confidence=$3,
+      claim_metric='deposit_amount',claim_unit='USD',claim_period='2026-01-01',claim_value=$4,
+      valid_from='2026-01-01T00:00:00Z' WHERE id=$1`, [rows[i]!.id, text, confidence, value]);
+  }
+  await engine.executeRaw('UPDATE facts SET embedding=NULL WHERE id=$1', [rows[2]!.id]);
+}
+
+for (const managed of [false, true]) {
+  for (const dryRun of [false, true]) {
+    test(`equal-time typed facts remain unchanged (${managed ? 'managed' : 'unmanaged'}, ${dryRun ? 'preview' : 'apply'})`, async () => {
+      await fixture(async (engine, sourceId, root) => {
+        await seedTypedTimeTie(engine, sourceId);
+        const before = await engine.executeRaw('SELECT id,fact,valid_from,valid_until,consolidated_at,consolidated_into FROM facts WHERE source_id=$1 ORDER BY id', [sourceId]);
+        const original = readFileSync(join(root, 'people/example.md'), 'utf8');
+        if (managed) await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+        const result = await runPhaseConsolidate(engine, { sourceId, dryRun });
+        expect(result.status).toBe('warn');
+        expect(result.details.clusters_skipped_ambiguous_time).toBe(1);
+        expect(result.details.facts_consolidated).toBe(0);
+        expect(result.details.takes_written).toBe(0);
+        expect(await engine.executeRaw('SELECT id,fact,valid_from,valid_until,consolidated_at,consolidated_into FROM facts WHERE source_id=$1 ORDER BY id', [sourceId])).toEqual(before);
+        expect(await engine.executeRaw('SELECT t.id FROM takes t JOIN pages p ON p.id=t.page_id WHERE p.source_id=$1', [sourceId])).toHaveLength(0);
+        expect(readFileSync(join(root, 'people/example.md'), 'utf8')).toBe(original);
+        expect(await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_maintenance_consolidate'", [sourceId])).toHaveLength(0);
+      });
+    });
+  }
+}
+
+// Value: protects=typed ties with optional dimensions; fails_when=null splits the key;
+// why_new=previous fixture used USD and a period; seam=none; no_claim=all malformed inputs.
+for (const dimensions of ['present', 'null'] as const) {
+test(`public submission refuses equal-time typed consolidation before admission (${dimensions} dimensions)`, async () => {
+  await fixture(async (engine, sourceId) => {
+    await seedTypedTimeTie(engine, sourceId);
+    if (dimensions === 'null') await engine.executeRaw('UPDATE facts SET claim_unit=NULL,claim_period=NULL WHERE source_id=$1', [sourceId]);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    const authority = await maintenancePreflight(engine, sourceId);
+    if (!authority) throw new Error('Fixture expected a managed authority');
+    const cluster = (await engine.listFactsByEntity(sourceId, 'people/example', { activeOnly: true })).filter(f => f.embedding);
+    await expect(submitMaintenanceConsolidation(engine, authority, 'people/example', cluster,
+      { claim: cluster[0]!.fact, weight: 1, source: 'test', since: '2026-01-01' }))
+      .rejects.toMatchObject({ code: 'invalid_params', reason: 'consolidation_time_ambiguous', retryable: false });
+    expect(await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND intent->>'kind'='managed_maintenance_consolidate'", [sourceId])).toHaveLength(0);
+    expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1 AND (valid_until IS NOT NULL OR consolidated_at IS NOT NULL)', [sourceId])).toHaveLength(0);
+  });
+});
+}
+
+// Value: protects=old typed intents fail closed; fails_when=invalid time falls through;
+// why_new=previous fixture used valid ISO timestamps; seam=none; no_claim=arbitrary intent schemas.
+for (const timestamp of ['equal', 'invalid'] as const) {
+test(`a typed legacy intent is refused during managed preparation (${timestamp} timestamp)`, async () => {
+  await fixture(async (engine, sourceId, root) => {
+    await seed(engine, sourceId);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    const lock = (await acquireWorktree((await getWorktreeBinding(engine, sourceId))!, 5000))!;
+    try {
+      await expect(pendingWait(() => runPhaseConsolidate(engine, { sourceId }))).rejects.toMatchObject({ code: 'write_pending' });
+      await disposePersistenceConsumer(engine);
+    } finally { await lock.release(); }
+    const row = (await claimNextWrite(engine, localHostId()))!;
+    if (!row.intent) throw new Error('Fixture expected a maintenance intent');
+    // Preserve a real admitted envelope; model the facts an older producer
+    // could have admitted, without submitting invalid input through the new guard.
+    for (const [index, fact] of (row.intent.facts as Array<{ value: Record<string, unknown> }>).entries()) {
+      Object.assign(fact.value, { claim_metric: 'deposit_amount', claim_unit: 'USD', claim_period: 'monthly',
+        valid_from: timestamp === 'equal' ? '2026-01-01T00:00:00Z' : index === 0 ? 'invalid legacy timestamp' : fact.value.valid_from });
+    }
+    const original = readFileSync(join(root, 'people/example.md'), 'utf8');
+    await expect(prepareMaintenanceMutation(engine, row, { engine: engine.kind, embedding_disabled: true }))
+      .rejects.toMatchObject({ code: 'invalid_params', reason: 'consolidation_time_ambiguous', retryable: false });
+    expect(await engine.executeRaw('SELECT id FROM facts WHERE source_id=$1 AND consolidated_at IS NOT NULL', [sourceId])).toHaveLength(0);
+    expect(readFileSync(join(root, 'people/example.md'), 'utf8')).toBe(original);
+  });
+});
+}
+
+// Value: protects=changed or vanished contributors cannot form a validity chain;
+// fails_when=row-count or time checks are removed; why_new=missing row was untested;
+// seam=none; no_claim=native phase wiring (covered below).
+for (const change of ['timestamp', 'missing'] as const) {
+test(`unmanaged consolidation rejects a stale effective-time snapshot under the row lock (${change})`, async () => {
+  await fixture(async (engine, sourceId) => {
+    await seed(engine, sourceId);
+    const observed = await engine.listFactsByEntity(sourceId, 'people/example', { activeOnly: true });
+    if (change === 'timestamp') await engine.executeRaw("UPDATE facts SET valid_from=valid_from+interval '1 day' WHERE source_id=$1", [sourceId]);
+    else await engine.executeRaw('DELETE FROM facts WHERE id=$1', [observed[0]!.id]);
+    const before = await engine.executeRaw('SELECT id,valid_from,valid_until,consolidated_at FROM facts WHERE source_id=$1 ORDER BY id', [sourceId]);
+    await expect(engine.transaction(tx => validateConsolidationTimeSnapshot(tx, sourceId, observed)))
+      .rejects.toMatchObject({ code: 'revision_conflict' });
+    expect(await engine.executeRaw('SELECT id,valid_from,valid_until,consolidated_at FROM facts WHERE source_id=$1 ORDER BY id', [sourceId])).toEqual(before);
+  });
+});
+}
+
+// Value: protects=native phase checks live chronology before effects;
+// fails_when=phase validator or live tuple check is removed;
+// why_new=helper-only tests miss a disconnected phase; seam=none;
+// no_claim=production concurrency scheduling or model quality.
+for (const change of ['timestamp', 'typed_metadata'] as const) {
+test(`native unmanaged consolidation refuses chronology changed after clustering (${change})`, async () => {
+  await fixture(async (engine, sourceId, root) => {
+    await seed(engine, sourceId);
+    if (change === 'typed_metadata') await engine.executeRaw("UPDATE facts SET valid_from='2026-01-01T00:00:00Z' WHERE source_id=$1", [sourceId]);
+    const original = readFileSync(join(root, 'people/example.md'), 'utf8');
+    const page = (await engine.readPageSnapshot('people/example', { sourceId }))!;
+    const read = engine.listFactsByEntity;
+    const transaction = engine.transaction;
+    const readOwn = Object.getOwnPropertyDescriptor(engine, 'listFactsByEntity');
+    const transactionOwn = Object.getOwnPropertyDescriptor(engine, 'transaction');
+    let observedSnapshot = false;
+    let before: Array<Record<string, unknown>> | undefined;
+    engine.listFactsByEntity = async function (...args) {
+      const observed = await read.apply(this, args);
+      if (args[0] === sourceId) observedSnapshot = true;
+      return observed;
+    };
+    engine.transaction = async function (fn, opts) {
+      if (this === engine && observedSnapshot && before === undefined) {
+        await engine.executeRaw(change === 'timestamp'
+          ? "UPDATE facts SET valid_from=valid_from+interval '1 day' WHERE source_id=$1"
+          : "UPDATE facts SET claim_metric='deposit_amount',claim_unit='USD',claim_period='monthly' WHERE source_id=$1", [sourceId]);
+        before = await engine.executeRaw('SELECT id,valid_from,valid_until,consolidated_at,consolidated_into FROM facts WHERE source_id=$1 ORDER BY id', [sourceId]);
+      }
+      return transaction.bind(this)(fn, opts);
+    };
+    try {
+      const result = await runPhaseConsolidate(engine, { sourceId });
+      if (!before) throw new Error('Fixture expected a chronology change before publication');
+      expect(result.status).toBe('warn');
+      expect(result.details.facts_consolidated).toBe(0);
+      expect(result.details.takes_written).toBe(0);
+      expect(result.details.bucket_failures).toMatchObject([{ code: change === 'timestamp' ? 'revision_conflict' : 'invalid_params' }]);
+      expect(await engine.executeRaw('SELECT id,valid_from,valid_until,consolidated_at,consolidated_into FROM facts WHERE source_id=$1 ORDER BY id', [sourceId])).toEqual(before);
+      expect(await engine.executeRaw('SELECT id FROM takes WHERE page_id=$1', [page.page.id])).toHaveLength(0);
+      expect((await engine.readPageSnapshot('people/example', { sourceId }))!.revision).toBe(page.revision);
+      expect(readFileSync(join(root, 'people/example.md'), 'utf8')).toBe(original);
+    } finally {
+      if (readOwn) Object.defineProperty(engine, 'listFactsByEntity', readOwn);
+      else delete (engine as Partial<BrainEngine>).listFactsByEntity;
+      if (transactionOwn) Object.defineProperty(engine, 'transaction', transactionOwn);
+      else delete (engine as Partial<BrainEngine>).transaction;
+    }
+  });
+});
 }
 
 test('runCycle consolidates only its explicitly selected source across two eligible source clusters', async () => {

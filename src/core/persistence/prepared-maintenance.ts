@@ -1,4 +1,5 @@
 import { realpathSync } from 'node:fs';
+import { assertConsolidationTime } from '../facts/consolidation-time.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
 import { boundedReads } from './bounded-reads.ts';
 import { join } from 'node:path';
@@ -301,6 +302,7 @@ export async function submitMaintenanceConsolidation(engine: BrainEngine, author
   derivation?: DerivationDeclaration): Promise<Record<string, unknown>> {
   const sourceId = authority.writer.sourceId;
   const facts = await readFacts(engine, sourceId, cluster.map(f => f.id));
+  assertConsolidationTime(facts.map(f => f.value));
   if (facts.length !== cluster.length || facts.some(f => f.value.visibility !== 'world' || f.value.expired_at || f.value.consolidated_at)) {
     throw opError('revision_conflict', 'The consolidation facts are no longer eligible.',
       `Facts on ${slug} in '${sourceId}' were expired, consolidated or made private after clustering; nothing was submitted. The next consolidate run re-clusters the current facts.`);
@@ -541,6 +543,7 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
     { fix: receiptFix(row) });
   const p = row.intent;
   const facts = p.facts as FactSnapshot[];
+  assertConsolidationTime(facts.map(f => f.value));
   const pages = p.pages as EvidencePage[];
   const [existing] = await engine.executeRaw<{ id: number; row_num: number; active: boolean; resolved_at: unknown }>(
     "SELECT id,row_num,active,resolved_at FROM takes WHERE page_id=$1 AND claim=$2 AND kind='fact' AND holder='self' ORDER BY id LIMIT 1", [row.page_id, p.claim]);
@@ -569,6 +572,7 @@ async function prepareMaintenanceKind(engine: BrainEngine, row: WriteRequest, co
         }
       }
       const current = await readFacts(tx, row.source_id, facts.map(f => f.id), true);
+      assertConsolidationTime(current.map(f => f.value));
       if (digest(current) !== digest(facts) || current.some(f => f.value.visibility !== 'world' || f.value.expired_at || f.value.consolidated_at ||
         f.value.valid_until && Date.parse(String(f.value.valid_until)) <= Date.now())) {
         throw opError('revision_conflict', 'The consolidation evidence changed.',

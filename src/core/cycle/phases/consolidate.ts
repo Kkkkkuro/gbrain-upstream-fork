@@ -27,6 +27,7 @@ import type { Action } from '../../agent-output.ts';
 import type { BrainEngine, FactRow } from '../../engine.ts';
 import type { PhaseResult } from '../../cycle.ts';
 import { cosineSimilarity } from '../../facts/classify.ts';
+import { hasAmbiguousConsolidationTime, validateConsolidationTimeSnapshot } from '../../facts/consolidation-time.ts';
 import { claimsDiverge, EXPLICIT_DUPLICATE_THRESHOLD } from '../../facts/capture-dedup.ts';
 import { createHash } from 'node:crypto';
 import { isAborted } from '../../abort-check.ts';
@@ -156,6 +157,7 @@ export async function runPhaseConsolidate(
   let clustersSkippedRetired = 0;
   let clustersGateHeld = 0;
   let clustersGateRejected = 0;
+  let clustersSkippedAmbiguousTime = 0;
   // #6023: a dry run lists the clusters it would write so an operator can
   // inspect them before `--yes`; capped so the envelope stays bounded.
   const preview: ConsolidateClusterPreview[] = [];
@@ -263,6 +265,11 @@ export async function runPhaseConsolidate(
 
       for (const cluster of clusters) {
         if (cluster.length < 2) continue;
+        if (hasAmbiguousConsolidationTime(cluster.map(f => ({ valid_from: f.valid_from,
+          claim_metric: claims.get(f.id)?.metric, claim_unit: claims.get(f.id)?.unit, claim_period: claims.get(f.id)?.period })))) {
+          clustersSkippedAmbiguousTime++;
+          continue;
+        }
         // Take selection: pick the highest-confidence fact's text as the
         // take claim (v0.31 deterministic). v0.32 will swap to a Sonnet
         // synthesis pass.
@@ -346,6 +353,7 @@ export async function runPhaseConsolidate(
           gateConfig ??= (await loadImportSanityConfig(engine)).writeGate ?? DEFAULT_WRITE_GATE_CONFIG);
         if (gate && gate.action !== 'insert') { if (gate.action === 'hold') clustersGateHeld++; else clustersGateRejected++; continue; }
         const written = await derivedMaintenanceTransaction<{ created: boolean; takeId: number | null } | null>(engine, derivation, async tx => {
+          await validateConsolidationTimeSnapshot(tx, b.source_id, cluster);
           let takeId: number;
           let created = false;
           if (existing.length > 0) {
@@ -400,14 +408,15 @@ export async function runPhaseConsolidate(
 
   return {
     phase: 'consolidate',
-    status: bucketsFailed > 0 ? 'warn' : factsConsolidated === 0 && clustersSkippedRetired > 0 ? 'skipped' : 'ok',
+    status: bucketsFailed > 0 || clustersSkippedAmbiguousTime > 0 ? 'warn' : factsConsolidated === 0 && clustersSkippedRetired > 0 ? 'skipped' : 'ok',
     duration_ms: 0,
     summary: dryRun
-      ? `(dry-run) would promote ${factsConsolidated} facts into ${takesWritten} takes across ${bucketsProcessed} buckets`
+      ? `(dry-run) would promote ${factsConsolidated} facts into ${takesWritten} takes across ${bucketsProcessed} buckets; skipped ${clustersSkippedAmbiguousTime} ambiguous-time clusters`
       : `promoted ${factsConsolidated} facts into ${takesWritten} takes across ${bucketsProcessed} buckets` +
         (clustersSkippedRetired ? `; skipped ${clustersSkippedRetired} clusters with retired takes` : '') +
         (clustersGateHeld ? `; held ${clustersGateHeld} takes for write-gate review` : '') +
         (clustersGateRejected ? `; write gate rejected ${clustersGateRejected} takes` : '') +
+        (clustersSkippedAmbiguousTime ? `; skipped ${clustersSkippedAmbiguousTime} typed clusters with ambiguous effective times; review source chronology` : '') +
         (bucketsFailed ? `; ${bucketsFailed} bucket(s) failed (details.bucket_failures)` : ''),
     details: {
       dryRun,
@@ -422,6 +431,7 @@ export async function runPhaseConsolidate(
       clusters_skipped_retired: clustersSkippedRetired,
       clusters_gate_held: clustersGateHeld,
       clusters_gate_rejected: clustersGateRejected,
+      clusters_skipped_ambiguous_time: clustersSkippedAmbiguousTime,
       buckets_failed: bucketsFailed,
       bucket_failures: bucketFailures,
       ...(factsConsolidated === 0 && clustersSkippedRetired > 0 ? { reason: 'retired_take' } : {}),
