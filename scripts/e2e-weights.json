@@ -74,6 +74,7 @@
   "test/e2e/connectors-sync-checkpoints-pglite.test.ts": 3130,
   "test/e2e/connectors-sync-pglite.test.ts": 4910,
   "test/e2e/consolidate-divergence-postgres.test.ts": 802,
+  "test/e2e/consolidate-publication-locks.test.ts": 3370,
   "test/e2e/consumer-idle-lane-single-flight-postgres.test.ts": 2940,
   "test/e2e/context-engine-rung3-extraction.test.ts": 1540,
   "test/e2e/context-pack-provenance-postgres.test.ts": 894,
