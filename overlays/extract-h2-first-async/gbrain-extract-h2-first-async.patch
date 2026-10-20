@@ -1,0 +1,585 @@
+--- a/src/core/cycle/extract-atoms.ts
++++ b/src/core/cycle/extract-atoms.ts
+@@ -92,6 +92,7 @@
+ import { atomSourceDate } from './atom-source-date.ts';
+ import type { TranscriptPageIndex } from '../transcripts/discover.ts';
+ import { managedAtomSession, readAtomOrigin, resumeManagedAtoms, publishManagedAtoms, MANAGED_ATOM_DISCOVERY_SQL, type AtomOrigin } from '../persistence/atom-maintenance.ts';
++import * as atomResumeCompatibility from '../persistence/atom-maintenance.ts';
+ import { effectiveVisibility } from '../search/private-visibility.ts';
+ import { OperationError } from '../ops/contract.ts';
+ import { isOpPageSlug } from '../ops/context.ts';
+@@ -625,6 +626,57 @@
+ }
+ 
+ /**
++ * Durable per-item failure count, keyed to the CURRENT content hash so a
++ * content edit resets the streak. Returns the new consecutive count, or
++ * null on write failure (never blocks the phase).
++ *
++ * v146: transcripts are covered too. Their state lives in
++ * `extract_atoms_transcript_state`. Both reset on a content change for the
++ * same reason — the page counter is hash-keyed, the transcript row IS
++ * hash-keyed — and both feed the same MAX_DETERMINISTIC_FAILURES bound.
++ */
++async function recordAtomItemFailureCount(
++  engine: BrainEngine, sourceId: string, item: ExtractAtomsItem, dryRun: boolean, managed: boolean,
++  failures: Array<{ source: string; error: string }>,
++): Promise<number | null> {
++  if (dryRun || managed) return null;
++  const hash16 = item.contentHash.slice(0, 16);
++  if (item.kind === 'transcript') {
++    if (!item.filePath) return null;
++    try {
++      const rows = await engine.executeRaw<{ cnt: number | string }>(
++        `INSERT INTO extract_atoms_transcript_state
++           (source_id, file_path, content_hash, fail_count, updated_at)
++         VALUES ($1, $2, $3, 1, now())
++         ON CONFLICT (source_id, file_path, content_hash)
++         DO UPDATE SET fail_count = extract_atoms_transcript_state.fail_count + 1,
++                       updated_at = now()
++         RETURNING fail_count AS cnt`,
++        [sourceId, item.filePath, hash16],
++      );
++      const cnt = rows[0]?.cnt;
++      return cnt == null ? null : Number(cnt);
++    } catch (err) {
++      // A strike that never lands means this transcript never tombstones and
++      // re-spends budget forever (#4916's class) — say so. A missing table
++      // was already warned once by the tombstone check above.
++      if (!isMissingSchemaObject(err, 'table', 'extract_atoms_transcript_state')) {
++        console.error(`[extract_atoms] transcript failure-count write failed for ${item.filePath}: ${err instanceof Error ? err.message : String(err)}`);
++      }
++      return null;
++    }
++  }
++  try {
++    return await writeAtomPageState(engine, sourceId, item, 'failure');
++  } catch (err) {
++    const error = err instanceof AtomPageStateError ? err.message : new AtomPageStateError('storage').message;
++    failures.push({ source: item.slug, error });
++    console.error(`[extract_atoms] ${item.slug}: ${error}`);
++    return null;
++  }
++}
++
++/**
+  * v0.41 minimal extract_atoms body, rebuilt for v0.41.2.1.
+  *
+  * Test-driven minimum: takes _transcripts AND _pages directly when set,
+@@ -641,6 +693,7 @@
+   const managed = await managedAtomSession(engine, sourceId, opts._managedRetry, opts.attempt?.writeWait);
+   const atomFiles = await derivedWriteThrough(engine, 'extract_atoms', sourceId, { managed: managed !== null, dryRun: opts.dryRun ?? false });
+   const writeRequests: WriteReceipt[] = [];
++  const haltRequestIds = new Set<string>();
+   const pageAtomTitles = new Map<string, Map<string, string[]>>();
+ 
+   // 1a. Get transcripts (test seam OR production discovery).
+@@ -933,6 +986,8 @@
+   // EXCEPT the ones TRANSIENT_EXTRACT_ERROR_RE + the rate_limit abort class
+   // say are "retryable, never counted" — see that regex's doc comment.
+   let hardFailureCount = 0;
++  let terminalReplayFailures = 0;
++  let modelAttempted = false;
+   let writesPending = 0; // #5601: accepted atom batches still publishing (progress, not failures)
+   let heldFailed = 0;
+   let inputTruncated = 0; // #6503: items cut at the input cap this run (partial disposition, see extract-atoms-input.ts)
+@@ -945,55 +1000,8 @@
+     if (item.kind === 'page' && item.identity && input.plan && published.every(receipt => receipt.state === 'committed')) await commitExtractionPlan(engine, item.identity.pageId, input.plan);
+   }
+ 
+-  /**
+-   * Durable per-item failure count, keyed to the CURRENT content hash so a
+-   * content edit resets the streak. Returns the new consecutive count, or
+-   * null on write failure (never blocks the phase).
+-   *
+-   * v146: transcripts are covered too. Their state lives in
+-   * `extract_atoms_transcript_state`. Both reset on a content change for the
+-   * same reason — the page counter is hash-keyed, the transcript row IS
+-   * hash-keyed — and both feed the same MAX_DETERMINISTIC_FAILURES bound.
+-   */
+-  async function recordItemFailureCount(
+-    item: WorkItem,
+-  ): Promise<number | null> {
+-    if (opts.dryRun || managed) return null;
+-    const hash16 = item.contentHash.slice(0, 16);
+-    if (item.kind === 'transcript') {
+-      if (!item.filePath) return null;
+-      try {
+-        const rows = await engine.executeRaw<{ cnt: number | string }>(
+-          `INSERT INTO extract_atoms_transcript_state
+-             (source_id, file_path, content_hash, fail_count, updated_at)
+-           VALUES ($1, $2, $3, 1, now())
+-           ON CONFLICT (source_id, file_path, content_hash)
+-           DO UPDATE SET fail_count = extract_atoms_transcript_state.fail_count + 1,
+-                         updated_at = now()
+-           RETURNING fail_count AS cnt`,
+-          [sourceId, item.filePath, hash16],
+-        );
+-        const cnt = rows[0]?.cnt;
+-        return cnt == null ? null : Number(cnt);
+-      } catch (err) {
+-        // A strike that never lands means this transcript never tombstones and
+-        // re-spends budget forever (#4916's class) — say so. A missing table
+-        // was already warned once by the tombstone check above.
+-        if (!isMissingSchemaObject(err, 'table', 'extract_atoms_transcript_state')) {
+-          console.error(`[extract_atoms] transcript failure-count write failed for ${item.filePath}: ${err instanceof Error ? err.message : String(err)}`);
+-        }
+-        return null;
+-      }
+-    }
+-    try {
+-      return await writeAtomPageState(engine, sourceId, item, 'failure');
+-    } catch (err) {
+-      const error = err instanceof AtomPageStateError ? err.message : new AtomPageStateError('storage').message;
+-      failures.push({ source: item.slug, error });
+-      console.error(`[extract_atoms] ${item.slug}: ${error}`);
+-      return null;
+-    }
+-  }
++  const recordItemFailureCount = (item: WorkItem) =>
++    recordAtomItemFailureCount(engine, sourceId, item, opts.dryRun ?? false, managed !== null, failures);
+ 
+   // gbrain#4148 content-deterministic classes: hash-keyed bounded tombstone (v146: transcripts too).
+   async function recordDeterministicFailure(item: WorkItem, source: string, error: string): Promise<void> {
+@@ -1042,6 +1050,7 @@
+       const cutLine = truncated ? inputTruncatedLine(originLabel, input, maxInputChars) : null; // A7: a complete appended-tail read prints nothing
+       if (cutLine) { inputTruncated++; console.error(cutLine); } // counted only for a model call
+ 
++      modelAttempted = true;
+       const result = await chat({
+         model: extractModel,
+         ...atomsPrompt(dateGrounding, originLabel, promptContent),
+@@ -1242,7 +1251,8 @@
+       // Reporter rate-limits to ~1 line/sec; safe to tick every iter.
+       opts.progress?.tick(1, `${totalAtomsExtracted} atoms / ${duplicatesSkipped} skipped`);
+     } catch (err) {
+-      writeRequests.push(...atomPublicationErrorReceipts(err));
++      const errorReceipts = atomPublicationErrorReceipts(err);
++      writeRequests.push(...errorReceipts);
+       if (acceptedPendingReceipt(err)) { writesPending++; continue; }
+       if (opts.signal?.aborted) {
+         stoppedEarly = true;
+@@ -1255,6 +1265,15 @@
+         else pagesSkipped++;
+         continue;
+       }
++      if (typeof atomResumeCompatibility.isReplayedAtomConflict === 'function' && atomResumeCompatibility.isReplayedAtomConflict(err)) {
++        terminalReplayFailures++;
++        hardFailureCount++;
++        failures.push({ source: originLabel, error: err instanceof Error ? err.message : String(err) });
++        continue; // No new item failure/tombstone for an unchanged terminal publication refusal.
++      }
++      // Attribute only conflicts this phase actually observed, never a pending sibling
++      // that happens to settle while another item is failing.
++      for (const receipt of errorReceipts) if (receipt.state === 'conflict') haltRequestIds.add(receipt.request_id);
+       // gbrain#4148: classify. Transient provider/infra errors (timeouts,
+       // rate limits, 5xx, network) stay retryable and are NOT counted toward
+       // any tombstone. A provider content block (prompt-level refusal) is
+@@ -1296,12 +1315,15 @@
+   });
+   estimatedSpendUsd = budgetTracker.totalSpent;
+ 
+-  // Record the unchanged receipt/rollup effects with a run-level metadata join, even for zero-yield halts.
++  // Keep run-level audit attribution. Pure old terminal replays retain WARN/receipts without a new round contribution.
+   const run = await finalizeAtomsRun(engine, { sourceId, sourceIncarnation: managed?.incarnation, model: extractModel,
+     managed: managed !== null, dryRun: opts.dryRun ?? false, hardStopped: opts.signal?.aborted === true,
+     atoms: totalAtomsExtracted, transcripts: transcriptsProcessed, pages: pagesProcessed, costUsd: estimatedSpendUsd,
+     stop: { deadline_hit: stoppedEarly, error: hardFailureCount > 0 ? providerHaltReason(abortedGlobalError) ?? 'item_error' : false },
+-    requestIds: writeRequests.map(receipt => receipt.request_id) });
++    requestIds: writeRequests.map(receipt => receipt.request_id), haltRequestIds: [...haltRequestIds],
++    terminalReplayOnly: terminalReplayFailures > 0 && failures.length === terminalReplayFailures
++      && hardFailureCount === terminalReplayFailures && !modelAttempted && !managed?.resumedUnsettledBatch
++      && writesPending === 0 && !stoppedEarly && !budgetExhausted && !opts.signal?.aborted && !opts.stopSignal?.aborted });
+ 
+   return reportFileHolds({
+     phase: 'extract_atoms',
+@@ -1339,6 +1361,7 @@
+       held_failed: heldFailed,
+       input_truncated: inputTruncated,
+       failures,
++      ...(terminalReplayFailures > 0 ? { terminal_replay_failures: terminalReplayFailures } : {}),
+       ...(managed ? { write_requests: writeRequests } : {}),
+       ...(abortedGlobalError ? { aborted_global_error: abortedGlobalError } : {}),
+       malformed_outputs: malformedOutputs, stopped_outputs: stoppedOutputs,
+--- a/src/core/extract/atoms-run-finalization.ts
++++ b/src/core/extract/atoms-run-finalization.ts
+@@ -1,6 +1,6 @@
+ /** Per-run attribution of atoms rollup contributions, including zero-yield halts.
+  * Intent without a result is UNKNOWN, never proof that the cache was updated.
+- * Best-effort local metadata, not durable publication receipts or a DB transaction.
++ * JSONL metadata is best-effort; managed conflict attribution commits with the rollup.
+  */
+ import { randomUUID } from 'node:crypto';
+ import type { BrainEngine } from '../engine.ts';
+@@ -8,6 +8,7 @@
+ import { createAuditWriter } from '../audit/audit-writer.ts';
+ import { writeReceipt } from './receipt-writer.ts';
+ import { classifyRunStop, upsertExtractRollup } from './rollup-writer.ts';
++import { PERSISTENCE_PROTOCOL_PREDICATE } from '../persistence/protocol.ts';
+ 
+ type Stop = Parameters<typeof classifyRunStop>[0];
+ export interface AtomsRunFinalization {
+@@ -23,12 +24,17 @@
+   costUsd: number;
+   stop: Stop;
+   requestIds: string[];
++  /** New conflicting request receipts actually observed by this phase. */
++  haltRequestIds?: string[];
++  /** Only unchanged terminal conflicts were observed: retain WARN/audit, add no H/C/E round. */
++  terminalReplayOnly?: boolean;
+ }
+ 
+ const writer = createAuditWriter<{ ts: string; event: 'rollup_intent' | 'rollup_result'; run_id: string;
+   version: string; source_id: string; source_incarnation?: string; model?: string;
+   request_ids: string[]; request_count: number; request_ids_omitted: number; deltas?: ReturnType<typeof classifyRunStop> & { cost_delta: number; day: string };
+   rollup_written?: boolean;
++  rollup_skipped?: 'terminal_replay_no_contribution';
+ }>({ featureName: 'atoms-run', errorTrailer: '; rollup and phase outcomes remain unchanged' });
+ 
+ let fallbackSequence = 0;
+@@ -52,9 +58,43 @@
+     ...(input.sourceIncarnation && uuid.test(input.sourceIncarnation) ? { source_incarnation: input.sourceIncarnation } : {}),
+     ...(/^[a-z0-9_-]+:[a-zA-Z0-9._/-]+$/.test(input.model) ? { model: input.model } : {}),
+     request_ids: requestIds, request_count: input.requestIds.length, request_ids_omitted: input.requestIds.length - requestIds.length };
+-  const deltas = { ...classifyRunStop(input.stop), cost_delta: input.costUsd, day: new Date().toISOString().slice(0, 10) };
++  const replayOnly = input.terminalReplayOnly === true && input.managed && requestIds.length > 0 && input.atoms === 0 && input.pages === 0
++    && input.transcripts === 0 && input.costUsd === 0 && input.stop.error === 'item_error'
++    && !input.stop.deadline_hit && !input.stop.budget_exhausted;
++  const deltas = { ...(replayOnly ? { round_completed_delta: 0, halt_delta: 0, expected_limit_delta: 0 } : classifyRunStop(input.stop)),
++    cost_delta: input.costUsd, day: new Date().toISOString().slice(0, 10) };
+   if (runId) writer.log({ event: 'rollup_intent', ...metadata, deltas });
+-  const result = await upsertExtractRollup(engine, { kind: 'atoms', source_id: input.sourceId, ...deltas });
++  if (replayOnly) {
++    if (runId) writer.log({ event: 'rollup_result', ...metadata, rollup_written: false, rollup_skipped: 'terminal_replay_no_contribution' });
++    return runId ? { run_id: runId } : {};
++  }
++  // Keep the existing rollup writer (including its error handling), but attach the
++  // attribution update to its statement. PostgreSQL/PGLite commit both or neither;
++  // a failed best-effort rollup must never make a first conflict look like a replay.
++  const haltIds = [...new Set((input.haltRequestIds ?? []).filter(id => uuid.test(id)))];
++  let rollupEngine = engine;
++  if (input.managed && deltas.halt_delta > 0 && haltIds.length > 0
++    && input.sourceIncarnation && uuid.test(input.sourceIncarnation)) {
++    rollupEngine = Object.create(engine) as BrainEngine;
++    rollupEngine.executeRaw = (sql, params = [], opts) => {
++      const n = params.length;
++      return engine.executeRaw(`WITH extract_halt_protocol AS MATERIALIZED (
++        SELECT ${PERSISTENCE_PROTOCOL_PREDICATE} AS declared,
++          set_config('synchronous_commit','on',true) AS durable
++        FROM persistence_brain WHERE singleton=1 FOR SHARE
++      ), extract_halt_attribution AS (
++        UPDATE persistence_requests SET outcome=COALESCE(outcome,'{}'::jsonb)
++          || '{"extract_halt_attributed":true}'::jsonb
++        FROM extract_halt_protocol WHERE extract_halt_protocol.declared AND source_id=$${n + 1} AND source_incarnation=$${n + 2}::uuid
++          AND request_id=ANY($${n + 3}::uuid[]) AND state='conflict' AND operation='submit_job'
++          AND (COALESCE(intent->>'kind',outcome->>'atom_kind') IN
++            ('managed_atom_page','managed_atom_delete','managed_atom_complete')
++            OR (compacted AND slug='__managed_atom_complete__'))
++          AND outcome->'extract_halt_attributed' IS DISTINCT FROM 'true'::jsonb
++      ) ${sql}`, [...params, input.sourceId, input.sourceIncarnation, haltIds], opts);
++    };
++  }
++  const result = await upsertExtractRollup(rollupEngine, { kind: 'atoms', source_id: input.sourceId, ...deltas });
+   if (runId) writer.log({ event: 'rollup_result', ...metadata, rollup_written: result.ok });
+   return runId ? { run_id: runId } : {};
+ }
+--- a/src/core/persistence/atom-maintenance.ts
++++ b/src/core/persistence/atom-maintenance.ts
+@@ -19,7 +19,7 @@
+ import { assertPersistenceAccepting, awaitWrite, waitForWrite, writeResponse } from './service.ts';
+ import { MaintenanceWriteWait } from './maintenance-wait.ts';
+ import type { PreparedMutation } from './coordinator.ts';
+-import type { WriteAuthority, WriteRequest } from './model.ts';
++import { isTerminal, type WriteAuthority, type WriteRequest } from './model.ts';
+ import type { WriteReceipt } from './types.ts';
+ import { MAX_DETERMINISTIC_FAILURES, writeAtomPageState } from '../cycle/extract-atoms-page-state.ts';
+ import { effectiveVisibility } from '../search/private-visibility.ts';
+@@ -48,12 +48,19 @@
+   retry?: AtomClaim & { checkpointKey: string; rows: WriteRequest[]; origin: AtomOrigin };
+   /** #6325: the automatic attempt each failed drain key resumes under, claimed against that key's failed checkpoint. */
+   attempts?: Map<string, AtomClaim>;
++  /** This phase observed an unsettled batch; its eventual result is new work, not a pure terminal replay. */
++  resumedUnsettledBatch?: boolean;
+ }
+ /** The run key a batch is admitted under and, for a retry, the checkpoint it advances (compare-and-set). */
+ interface AtomClaim { runKey: string; checkpointKey?: string; expectedCheckpoint?: unknown }
+ /** One `managed-atoms` checkpoint row. `attempts` counts completed failures of its content; `held` marks the bound; `partial` the input cap a cut item was read under (#6503). */
+ interface AtomCheckpoint { requestId?: string; failure?: string; attempts?: number; held?: boolean; partial?: number }
+ export type AtomResume = 'run' | 'done' | 'held';
++// Internal identity, never inferred from provider text or a caller-supplied error field.
++const replayedAtomConflicts = new WeakSet<OperationError>();
++export function isReplayedAtomConflict(error: unknown): boolean {
++  return error instanceof OperationError && replayedAtomConflicts.has(error);
++}
+ export interface AtomIntent extends Record<string, unknown> {
+   kind: 'managed_atom_page' | 'managed_atom_delete' | 'managed_atom_complete';
+   runKey: string;
+@@ -368,10 +375,24 @@
+ async function resumeAtomBatch(engine: BrainEngine, session: ManagedAtomSession, key: string): Promise<'run' | 'done' | WriteRequest> {
+   const rows = await atomBatchRows(engine, session, key);
+   if (!rows.length) return 'run';
++  const settledAtRead = rows.every(isTerminal);
++  if (!settledAtRead) session.resumedUnsettledBatch = true;
++  const completeAtRead = rows.some(row => row.request_id === atomRequestId(key, '__managed_atom_complete__'));
+   for (const row of rows) {
+     await authorizeStoredRequest(engine, row);
+     const completed = session.wait.observe(await waitForWrite(engine, row, session.config, session.wait.ms()));
+-    writeResponse(completed);
++    try { writeResponse(completed); }
++    catch (error) {
++      // Retain the exact refusal and receipt. Only a batch already entirely terminal at entry
++      // can be a replay, and only after a prior rollup actually attributed its halt.
++      // Terminal-at-read alone also includes a conflict first settled after a pending phase.
++      if (!session.retry && settledAtRead && completeAtRead && row.outcome?.extract_halt_attributed === true
++        && row.state === 'conflict' && completed.state === 'conflict'
++        && row.request_id === completed.request_id && row.error_code === completed.error_code && error instanceof OperationError) {
++        replayedAtomConflicts.add(error);
++      }
++      throw error;
++    }
+     if (completed.outcome?.failure) return completed;
+   }
+   if (!rows.some(row => row.request_id === atomRequestId(key, '__managed_atom_complete__'))) throw opError('storage_error', 'The accepted atom batch has no completion receipt.',
+--- a/test/h2-first-async-halt.test.ts
++++ b/test/h2-first-async-halt.test.ts
+@@ -0,0 +1,114 @@
++import { beforeAll, beforeEach, afterAll, expect, test } from 'bun:test';
++import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
++import { join } from 'node:path';
++import { tmpdir } from 'node:os';
++import { PGLiteEngine } from '../src/core/pglite-engine.ts';
++import { configureGateway, resetGateway, __setChatTransportForTests, type ChatResult } from '../src/core/ai/gateway.ts';
++import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
++import { runPhaseExtractAtoms } from '../src/core/cycle/extract-atoms.ts';
++import { declareDurablePersistence } from '../src/core/persistence/protocol.ts';
++import { compactReceipt } from '../src/core/persistence/journal.ts';
++import { disposePersistenceConsumer, waitForWrite } from '../src/core/persistence/service.ts';
++import { registerLocalWriter } from '../src/core/persistence/identity.ts';
++import { claimWorktree } from '../src/core/persistence/ownership.ts';
++import { serializePageToMarkdown } from '../src/core/markdown.ts';
++import { sha256 } from '../src/core/persistence/digest.ts';
++import { resetPgliteState } from './helpers/reset-pglite.ts';
++import { withEnv } from './helpers/with-env.ts';
++let engine: PGLiteEngine;
++const evidence: Record<string, unknown>={backend:'isolated in-memory PGLite',production_modified:false,real_provider_calls:0};
++beforeAll(async()=>{ configureGateway({embedding_model:'openai:text-embedding-3-large',embedding_dimensions:1536,env:{}}); engine=new PGLiteEngine();await engine.connect({});await engine.initSchema();},120000);
++beforeEach(async()=>{await disposePersistenceConsumer(engine);await resetPgliteState(engine);});
++afterAll(async()=>{await engine.disconnect();resetGateway();});
++const sourceId='terminal-replay-boundary';
++const chat:()=>Promise<ChatResult>=async()=>({text:JSON.stringify(['Measured progress','Explicit ownership'].map(title=>({title,atom_type:'insight',body:`Use ${title.toLowerCase()} to guide the project.`}))),blocks:[],stopReason:'end',usage:{input_tokens:10,output_tokens:10,cache_read_tokens:0,cache_creation_tokens:0},model:'anthropic:claude-haiku-4-5',providerId:'anthropic'});
++const rollup=()=>engine.executeRaw('SELECT halt_count,round_completed_count,expected_limit_count,cost_usd,halt_reasons FROM extract_rollup_7d WHERE source_id=$1',[sourceId]);
++const receipts=()=>engine.executeRaw('SELECT request_id,state,outcome,error_code,error_message FROM persistence_requests WHERE source_id=$1 ORDER BY sequence',[sourceId]);
++async function fixture(fn:(root:string)=>Promise<void>){
++ const home=mkdtempSync(join(tmpdir(),'extract-health-r6-async-'));
++ try{await withEnv({GBRAIN_HOME:home,GBRAIN_AUDIT_DIR:join(home,'audit')},async()=>{
++  await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
++  await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)',[sourceId]);
++  const root=join(home,'repo');mkdirSync(join(root,'notes'),{recursive:true});
++  await engine.putPage('notes/2026-01-01-origin',{type:'source',title:'Origin',compiled_truth:'Synthetic bounded project evidence. '.repeat(40),frontmatter:{visibility:'private'}},{sourceId});
++  const page=(await engine.getPage('notes/2026-01-01-origin',{sourceId}))!;
++  writeFileSync(join(root,`${page.slug}.md`),serializePageToMarkdown(page,[]));
++  await engine.executeRaw('UPDATE sources SET local_path=$2 WHERE id=$1',[sourceId,root]);
++  await registerLocalWriter(engine,'cli');await claimWorktree(engine,sourceId,root);
++  mkdirSync(join(root,'atoms/2026-01-01'),{recursive:true});
++  writeFileSync(join(root,`atoms/2026-01-01/explicit-ownership-${sha256(`${page.slug}\0Explicit ownership`).slice(0,8)}.md`),'Unindexed operator content.');
++  await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
++  const restoreWait=__setMaintenanceWriteWaitForTests(0);
++  let first;try { first=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:chat}); } finally { restoreWait(); }
++  const phaseA={status:first.status,details:first.details,rollup:await rollup()};
++  evidence.phaseA=phaseA;
++  expect(first.details?.write_pending).toBeGreaterThan(0);
++  expect(await rollup()).toMatchObject([{halt_count:0,round_completed_count:1,expected_limit_count:0}]);
++  const accepted=await engine.executeRaw('SELECT * FROM persistence_requests WHERE source_id=$1 ORDER BY sequence',[sourceId]);
++  await waitForWrite(engine,accepted.at(-1) as never,{engine:engine.kind},20000);
++  await disposePersistenceConsumer(engine);
++  await fn(root);
++ });}finally{__setChatTransportForTests(null);await disposePersistenceConsumer(engine);rmSync(home,{recursive:true,force:true});}
++
++}
++
++test('R6: first observed conflict after an earlier pending phase must contribute its first halt',async()=>fixture(async()=>{
++ const before=await rollup();const old=await receipts();let calls=0;
++ const phase=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:async()=>{calls++;throw new Error('FORBIDDEN provider');}});
++ const after=await rollup();
++ evidence.phaseB={before,after,phase,receipts:old,second_model_calls:calls};
++ if(process.env.GBRAIN_TEST_EVIDENCE_PATH)writeFileSync(process.env.GBRAIN_TEST_EVIDENCE_PATH,JSON.stringify(evidence,null,2));
++ expect(phase.status).toBe('warn');expect(calls).toBe(0);expect(after).toMatchObject([{halt_count:1,round_completed_count:1,expected_limit_count:0}]);
++ const attributed=await receipts();
++ const observed=(phase.details?.write_requests as Array<{request_id:string;state:string}>).filter(row=>row.state==='conflict');expect(observed).toHaveLength(1);
++ for(const receipt of observed)expect((attributed.find(row=>row.request_id===receipt.request_id)?.outcome as any)?.extract_halt_attributed).toBe(true);
++ // A batch may contain another unobserved conflict. Its terminal state alone is not attribution.
++ for(const receipt of attributed.filter(row=>row.state==='conflict'&&!observed.some(r=>r.request_id===row.request_id)))expect((receipt.outcome as any)?.extract_halt_attributed).not.toBe(true);
++ const phaseC=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:async()=>{calls++;throw new Error('FORBIDDEN provider');}});
++ const final=await rollup();expect(phaseC.status).toBe('warn');expect(phaseC.details?.terminal_replay_failures).toBe(1);expect(final).toEqual(after);expect(await receipts()).toEqual(attributed);expect(calls).toBe(0);
++ evidence.phaseC={rollup:final,phase:phaseC,model_calls:calls};
++ if(process.env.GBRAIN_TEST_EVIDENCE_PATH)writeFileSync(process.env.GBRAIN_TEST_EVIDENCE_PATH,JSON.stringify(evidence,null,2));
++}),120000);
++
++
++test('R6: a rejected rollup cannot persist attribution or suppress the next first halt',async()=>fixture(async()=>{
++ const before=await rollup(),beforeReceipts=await receipts();let calls=0;
++ const forbidden=async()=>{calls++;throw new Error('FORBIDDEN provider');};
++ await engine.executeRaw(`CREATE FUNCTION pg_temp.reject_async_halt_rollup() RETURNS trigger LANGUAGE plpgsql AS
++   'BEGIN RAISE EXCEPTION ''R6 isolated rollup rejection''; END'`);
++ await engine.executeRaw(`CREATE TRIGGER reject_async_halt_rollup BEFORE INSERT OR UPDATE ON extract_rollup_7d
++   FOR EACH ROW EXECUTE FUNCTION pg_temp.reject_async_halt_rollup()`);
++ try{
++  const failed=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:forbidden});
++  expect(failed.status).toBe('warn');expect(await rollup()).toEqual(before);expect(await receipts()).toEqual(beforeReceipts);
++ }finally{await engine.executeRaw('DROP TRIGGER reject_async_halt_rollup ON extract_rollup_7d');}
++ const recovered=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:forbidden});
++ expect(recovered.status).toBe('warn');const after=await rollup();expect(after).toMatchObject([{halt_count:1,round_completed_count:1,expected_limit_count:0}]);
++ const replay=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:forbidden});expect(replay.details?.terminal_replay_failures).toBe(1);expect(await rollup()).toEqual(after);expect(calls).toBe(0);
++ evidence.rollupFailure={before,after,unchanged_receipts_on_rejection:true,model_calls:calls};
++ if(process.env.GBRAIN_TEST_EVIDENCE_PATH)writeFileSync(process.env.GBRAIN_TEST_EVIDENCE_PATH,JSON.stringify(evidence,null,2));
++}),120000);
++
++
++for(const boundary of ['compacted-conflicts','protocol2'])test(`R6: first async halt stays attributed across ${boundary}`,async()=>fixture(async()=>{
++ let calls=0;const forbidden=async()=>{calls++;throw new Error('FORBIDDEN provider');};
++ if(boundary==='protocol2')await engine.transaction(async tx=>{
++  await declareDurablePersistence(tx);
++  await tx.executeRaw(`INSERT INTO persistence_writer_protocols(worktree_id,host_id,owner_epoch,protocol_version)
++    SELECT id,owner_host_id,owner_epoch,2 FROM persistence_worktrees WHERE state='active'`);
++  await tx.executeRaw("SELECT set_config('gbrain.writer_quiesced','true',true)");
++  await tx.executeRaw('UPDATE persistence_brain SET writer_protocol_floor=2 WHERE singleton=1');
++ });
++ if(boundary==='compacted-conflicts'){
++  const conflicts=await engine.executeRaw("SELECT * FROM persistence_requests WHERE source_id=$1 AND state='conflict'",[sourceId]);
++  expect(conflicts.length).toBeGreaterThan(0);
++  for(const row of conflicts)expect(await compactReceipt(engine,row as never,{states:['conflict']})).toHaveProperty('freed_bytes');
++ }
++ {
++  const first=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:forbidden});expect(first.status).toBe('warn');
++  const after=await rollup();expect(after).toMatchObject([{halt_count:1,round_completed_count:1,expected_limit_count:0}]);
++  const next=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:forbidden});expect(next.details?.terminal_replay_failures).toBe(1);expect(await rollup()).toEqual(after);expect(calls).toBe(0);
++  evidence[boundary]={first:first.details,next:next.details,after,model_calls:calls};
++  if(process.env.GBRAIN_TEST_EVIDENCE_PATH)writeFileSync(process.env.GBRAIN_TEST_EVIDENCE_PATH,JSON.stringify(evidence,null,2));
++ }
++}),120000);
+--- a/test/h2-terminal-replay-boundaries.test.ts
++++ b/test/h2-terminal-replay-boundaries.test.ts
+@@ -0,0 +1,90 @@
++import { beforeAll, beforeEach, afterAll, expect, test } from 'bun:test';
++import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync } from 'node:fs';
++import { join } from 'node:path';
++import { tmpdir } from 'node:os';
++import { PGLiteEngine } from '../src/core/pglite-engine.ts';
++import { configureGateway, resetGateway, __setChatTransportForTests, type ChatResult } from '../src/core/ai/gateway.ts';
++import { normalizeAIError } from '../src/core/ai/errors.ts';
++import { runPhaseExtractAtoms } from '../src/core/cycle/extract-atoms.ts';
++import { stampExtractAtomsRun } from '../src/core/cycle/extract-atoms-stamp.ts';
++import { runExtractAtomsDrainForSource } from '../src/core/cycle/extract-atoms-drain.ts';
++import { finalizeAtomsRun } from '../src/core/extract/atoms-run-finalization.ts';
++import { disposePersistenceConsumer, waitForWrite } from '../src/core/persistence/service.ts';
++import { registerLocalWriter } from '../src/core/persistence/identity.ts';
++import { claimWorktree } from '../src/core/persistence/ownership.ts';
++import { serializePageToMarkdown } from '../src/core/markdown.ts';
++import { sha256 } from '../src/core/persistence/digest.ts';
++import { resetPgliteState } from './helpers/reset-pglite.ts';
++import { withEnv } from './helpers/with-env.ts';
++let engine: PGLiteEngine;
++beforeAll(async()=>{ configureGateway({embedding_model:'openai:text-embedding-3-large',embedding_dimensions:1536,env:{}}); engine=new PGLiteEngine();await engine.connect({});await engine.initSchema();},120000);
++beforeEach(async()=>{await disposePersistenceConsumer(engine);await resetPgliteState(engine);});
++afterAll(async()=>{await engine.disconnect();resetGateway();});
++const sourceId='terminal-replay-boundary';
++const chat:()=>Promise<ChatResult>=async()=>({text:JSON.stringify(['Measured progress','Explicit ownership'].map(title=>({title,atom_type:'insight',body:`Use ${title.toLowerCase()} to guide the project.`}))),blocks:[],stopReason:'end',usage:{input_tokens:10,output_tokens:10,cache_read_tokens:0,cache_creation_tokens:0},model:'anthropic:claude-haiku-4-5',providerId:'anthropic'});
++const rollup=()=>engine.executeRaw('SELECT halt_count,round_completed_count,expected_limit_count,cost_usd,halt_reasons FROM extract_rollup_7d WHERE source_id=$1',[sourceId]);
++const receipts=()=>engine.executeRaw('SELECT request_id,state,outcome,error_code,error_message FROM persistence_requests WHERE source_id=$1 ORDER BY sequence',[sourceId]);
++async function fixture(fn:(root:string)=>Promise<void>){
++ const home=mkdtempSync(join(tmpdir(),'terminal-replay-boundary-'));
++ try{await withEnv({GBRAIN_HOME:home,GBRAIN_AUDIT_DIR:join(home,'audit')},async()=>{
++  await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
++  await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)',[sourceId]);
++  const root=join(home,'repo');mkdirSync(join(root,'notes'),{recursive:true});
++  await engine.putPage('notes/2026-01-01-origin',{type:'source',title:'Origin',compiled_truth:'Synthetic bounded project evidence. '.repeat(40),frontmatter:{visibility:'private'}},{sourceId});
++  const page=(await engine.getPage('notes/2026-01-01-origin',{sourceId}))!;
++  writeFileSync(join(root,`${page.slug}.md`),serializePageToMarkdown(page,[]));
++  await engine.executeRaw('UPDATE sources SET local_path=$2 WHERE id=$1',[sourceId,root]);
++  await registerLocalWriter(engine,'cli');await claimWorktree(engine,sourceId,root);
++  mkdirSync(join(root,'atoms/2026-01-01'),{recursive:true});
++  writeFileSync(join(root,`atoms/2026-01-01/explicit-ownership-${sha256(`${page.slug}\0Explicit ownership`).slice(0,8)}.md`),'Unindexed operator content.');
++  await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
++  const first=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:chat});
++  expect(first.status).toBe('warn');expect(await rollup()).toMatchObject([{halt_count:1,round_completed_count:0,expected_limit_count:0}]);
++  const accepted=await engine.executeRaw('SELECT * FROM persistence_requests WHERE source_id=$1 ORDER BY sequence',[sourceId]);
++  await waitForWrite(engine,accepted.at(-1) as never,{engine:engine.kind},20000);
++  await disposePersistenceConsumer(engine);
++  await fn(root);
++ });}finally{__setChatTransportForTests(null);await disposePersistenceConsumer(engine);rmSync(home,{recursive:true,force:true});}
++}
++async function newPage(root:string){
++ await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
++ await engine.putPage('notes/2026-01-02-new',{type:'source',title:'New input',compiled_truth:'A new legitimate synthetic input. '.repeat(40),frontmatter:{visibility:'private'}},{sourceId});
++ const page=(await engine.getPage('notes/2026-01-02-new',{sourceId}))!;writeFileSync(join(root,`${page.slug}.md`),serializePageToMarkdown(page,[]));
++ await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
++}
++test('pure replay stays WARN with receipts; repeated phase/stamp/native drain makes no new H/C/E/cost or success stamp',async()=>fixture(async()=>{
++ const old=await receipts(),counts=await rollup(),state=await engine.executeRaw('SELECT * FROM extract_atoms_page_state ORDER BY page_id');let calls=0;
++ const forbidden=async()=>{calls++;throw new Error('FORBIDDEN provider call');};__setChatTransportForTests(forbidden);
++ for(let i=0;i<2;i++){
++  const phase=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:forbidden});expect(phase.status).toBe('warn');expect(phase.details?.terminal_replay_failures).toBe(1);expect((phase.details?.failures as unknown[]).length).toBe(1);
++  await stampExtractAtomsRun(engine,sourceId,phase);expect(await rollup()).toEqual(counts);expect(await receipts()).toEqual(old);
++ }
++ const drain=await runExtractAtomsDrainForSource(engine,{sourceId,windowSeconds:2,maxBatches:1});expect(drain.failure_count).toBe(1);expect(drain.failures.length).toBe(1);expect(drain.batches).toBe(1);expect(drain.remaining).toBe(1);expect(drain.stopped).not.toBe('drained');
++ expect(await rollup()).toEqual(counts);expect(await engine.executeRaw('SELECT * FROM extract_atoms_page_state ORDER BY page_id')).toEqual(state);expect(calls).toBe(0);
++ const [src]=await engine.executeRaw<{stamp:string|null}>("SELECT config->>'last_extract_atoms_at' AS stamp FROM sources WHERE id=$1",[sourceId]);expect(src.stamp).toBeNull();
++ const dir=join(process.env.GBRAIN_HOME!,'audit');const events=readdirSync(dir).filter(f=>f.startsWith('atoms-run-')).flatMap(f=>readFileSync(join(dir,f),'utf8').trim().split('\n').map(l=>JSON.parse(l)));
++ const skipped=events.filter(e=>e.rollup_skipped==='terminal_replay_no_contribution');expect(skipped.length).toBe(3);expect(skipped.every(e=>e.rollup_written===false)).toBe(true);
++}),120000);
++test('a pending batch that becomes terminal during resume remains a NEW halt',async()=>fixture(async()=>{
++ let injected=false;const observed=new Proxy(engine,{get(target,key){if(key==='executeRaw')return async(sql:string,params?:unknown[])=>{
++  const rows=await target.executeRaw(sql,params);if(!injected&&sql.includes("intent->>'runKey'=$5")&&rows.some((r:any)=>r.state==='conflict')){injected=true;return rows.map((r:any)=>r.state==='conflict'?{...r,state:'running'}:r);}return rows;
++ };const v=Reflect.get(target,key);return typeof v==='function'?v.bind(target):v;}});
++ const phase=await runPhaseExtractAtoms(observed as never,{sourceId,_transcripts:[],_chat:async()=>{throw new Error('FORBIDDEN provider');}});expect(injected).toBe(true);expect(phase.status).toBe('warn');expect(phase.details?.terminal_replay_failures).toBeUndefined();expect(await rollup()).toMatchObject([{halt_count:2,round_completed_count:0}]);
++}),120000);
++test('new successful work mixed with an old conflict retains failed-round accounting and legitimate publication',async()=>fixture(async root=>{
++ await newPage(root);let calls=0;const phase=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:async()=>{calls++;return chat();}});
++ expect(phase.status).toBe('warn');expect(calls).toBe(1);expect(phase.details?.terminal_replay_failures).toBe(1);expect(phase.details?.pages_processed).toBe(1);expect(await rollup()).toMatchObject([{halt_count:2,round_completed_count:0,expected_limit_count:0}]);
++}),120000);
++test('a NEW auth failure mixed with old replay still adds provider_auth halt',async()=>fixture(async root=>{
++ await newPage(root);const error=normalizeAIError(Object.assign(new Error('Synthetic 401'),{name:'AI_APICallError',statusCode:401}),'chat(deepseek:deepseek-v4-flash)');
++ const phase=await runPhaseExtractAtoms(engine,{sourceId,_transcripts:[],_chat:async()=>{throw error;}});expect(phase.status).toBe('warn');expect(await rollup()).toMatchObject([{halt_count:2,halt_reasons:{item_error:1,provider_auth:1}}]);
++}),120000);
++test('finalizer refuses replay-only accounting for new cost, successful work, cap or non-item error; audit skip is explicit',async()=>{
++ const home=mkdtempSync(join(tmpdir(),'terminal-replay-finalizer-'));try{await withEnv({GBRAIN_HOME:home,GBRAIN_AUDIT_DIR:home},async()=>{
++  const base={sourceId:'default',model:'deepseek:deepseek-v4-flash',managed:true,dryRun:false,hardStopped:false,atoms:0,transcripts:0,pages:0,costUsd:0,stop:{error:'item_error' as const},requestIds:['79deef41-eec7-4e9a-b9e8-f5163c31e06b'],terminalReplayOnly:true};
++  const cases=[{costUsd:0.01},{atoms:1},{pages:1},{transcripts:1},{stop:{error:'provider_auth' as const}},{stop:{error:'item_error' as const,deadline_hit:true}}];
++  for(const extra of cases)await finalizeAtomsRun(engine,{...base,...extra});
++  expect(await engine.executeRaw("SELECT halt_count,round_completed_count FROM extract_rollup_7d WHERE source_id='default'")).toEqual([{halt_count:6,round_completed_count:0}]);
++  const before=await engine.executeRaw("SELECT * FROM extract_rollup_7d WHERE source_id='default'");await finalizeAtomsRun(engine,base);expect(await engine.executeRaw("SELECT * FROM extract_rollup_7d WHERE source_id='default'")).toEqual(before);
++ });}finally{rmSync(home,{recursive:true,force:true});}
++});
+--- a/test/h2-terminal-replay.test.ts
++++ b/test/h2-terminal-replay.test.ts
+@@ -0,0 +1,30 @@
++import { test, expect } from 'bun:test';
++import { PGLiteEngine } from '../src/core/pglite-engine.ts';
++import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
++import { exerciseManagedAtomBatch } from '../test/helpers/managed-atoms-contract.ts';
++import { writeFileSync } from 'node:fs';
++
++test('H2: pure terminal conflict replay retains WARN and adds no new H/C/E round', async () => {
++  const engine = new PGLiteEngine();
++  configureGateway({ embedding_model: 'openai:text-embedding-3-large', embedding_dimensions: 1536, env: {} });
++  await engine.connect({}); await engine.initSchema();
++  const events: Array<Array<Record<string, unknown>>> = [];
++  const observed = new Proxy(engine, { get(target, key) {
++    if (key === 'executeRaw') return async (sql: string, params?: unknown[]) => {
++      const result = await target.executeRaw(sql, params);
++      if (sql.includes('INSERT INTO extract_rollup_7d') && params?.includes('atoms-partial-publication')) {
++        events.push(await target.executeRaw("SELECT halt_count,round_completed_count,expected_limit_count,halt_reasons FROM extract_rollup_7d WHERE source_id='atoms-partial-publication'"));
++      }
++      return result;
++    };
++    const value = Reflect.get(target,key); return typeof value === 'function' ? value.bind(target) : value;
++  }});
++  try {
++    await exerciseManagedAtomBatch(observed as never, 'partial_publication');
++    const rows = await engine.executeRaw("SELECT halt_count,round_completed_count,expected_limit_count,halt_reasons FROM extract_rollup_7d WHERE source_id='atoms-partial-publication'");
++    expect(events).toHaveLength(1);
++    expect(events[0]).toMatchObject([{halt_count:1,round_completed_count:0,halt_reasons:{item_error:1}}]);
++    expect(rows).toEqual(events[0]);
++    if (process.env.GBRAIN_TEST_EVIDENCE_PATH) writeFileSync(process.env.GBRAIN_TEST_EVIDENCE_PATH, JSON.stringify({backend:'isolated in-memory PGLite',scenario:'installed exerciseManagedAtomBatch partial_publication',events,final:rows,product_modified:false},null,2));
++  } finally { await engine.disconnect(); resetGateway(); }
++},120000);
