@@ -8,6 +8,7 @@ import { INSTALL_SCOPE, isMiniWriter } from './host.ts';
 const REAPPLY = [
   'overlays/backup-pending-continuation/reapply.ts',
   'overlays/subject-infer-alias/reapply.ts',
+  'overlays/extract-h2-first-async/reapply.ts',
 ] as const;
 
 export function repoRoot(): string {
