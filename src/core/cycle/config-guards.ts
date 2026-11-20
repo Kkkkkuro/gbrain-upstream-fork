@@ -6,14 +6,16 @@
  * takes a boolean word (#5425). Each throws an `invalid_params`
  * OperationError whose fix is a real command; nothing is written.
  */
+import { ATOM_EXCLUDED_SOURCES, parseExcludedAtomSources } from './atom-source-policy.ts';
 import { opError } from '../ops/contract.ts';
 import { CYCLE_LINT_EXCLUDE_KEY, parseCycleLintExclude } from './lint-fix-setting.ts';
 import { PATTERNS_LAST_RUN_KEY } from './patterns-plan.ts';
 import { ATTRIBUTION_CHECKS_KEY, parseAttributionChecks } from './attribution-checks.ts';
 
-export const CYCLE_GUARDED_KEYS: readonly string[] = [CYCLE_LINT_EXCLUDE_KEY, PATTERNS_LAST_RUN_KEY, ATTRIBUTION_CHECKS_KEY];
+export const CYCLE_GUARDED_KEYS: readonly string[] = [ATOM_EXCLUDED_SOURCES, CYCLE_LINT_EXCLUDE_KEY, PATTERNS_LAST_RUN_KEY, ATTRIBUTION_CHECKS_KEY];
 
 export function assertCycleConfigValue(key: string, value: string): void {
+  if (key === ATOM_EXCLUDED_SOURCES) { parseExcludedAtomSources(value); return; }
   if (key === CYCLE_LINT_EXCLUDE_KEY) { parseCycleLintExclude(value); return; }
   if (key === ATTRIBUTION_CHECKS_KEY) {
     if (parseAttributionChecks(value) !== null) return;

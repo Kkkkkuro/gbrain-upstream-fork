@@ -1940,6 +1940,7 @@
     "cycle.consolidate.cluster_threshold",
     "cycle.consolidate.enabled",
     "cycle.extract_atoms.budget_usd",
+    "cycle.extract_atoms.excluded_sources",
     "cycle.extract_atoms.max_input_chars",
     "cycle.extract_atoms.max_output_tokens",
     "cycle.extract_atoms.max_source_chars",

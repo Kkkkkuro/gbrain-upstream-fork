@@ -282,6 +282,15 @@ estimate is `delta + stale backlog`, labeled as such.
 **Say to your agent:** *"Extract atoms from my Gmail and Calendar pages too"* or
 *"Stop spending on automatic atom extraction."*
 
+To keep named sources available for retrieval while excluding their pages and transcripts from provider-based atom extraction, set the complete list of exact source IDs locally:
+
+```sh
+gbrain config set cycle.extract_atoms.excluded_sources '["reports"]'
+gbrain config get cycle.extract_atoms.excluded_sources
+```
+
+Doctor reports eligible backlog and the number of otherwise eligible pages excluded by this policy. Source grants also limit the excluded count on a remote Doctor. The routine cycle, automatic drain, and explicit atom extraction read the same policy. A running phase checks it again before each provider request. Requests already sent can finish. The default is an empty list. This setting applies only to atom extraction.
+
 When the active schema pack does not run `extract_atoms` in the routine cycle,
 autopilot (Postgres brains) submits a bounded `extract-atoms-drain` job per
 source with a backlog. Each drain **attempt** runs under one BudgetTracker

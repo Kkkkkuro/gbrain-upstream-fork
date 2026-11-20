@@ -5,6 +5,7 @@
  * doctor.ts) and buildChecks / doctorReportRemote consume them.
  */
 import { join } from 'path';
+import { countExtractAtomsBacklogScoped, policyExcludedAtomPages } from './atom-source-coverage.ts';
 import { existsSync, readdirSync } from 'fs';
 import type { BrainEngine } from '../../../core/engine.ts';
 import { probeSourceGitState } from '../../../core/git-head.ts';
@@ -541,22 +542,6 @@ async function countExtractAtomsBacklogBySource(
   }
 }
 
-/** Total backlog: brain-wide when unscoped, else the sum over the granted ids. */
-async function countExtractAtomsBacklogScoped(
-  engine: BrainEngine,
-  countBacklog: ExtractAtomsBacklogCounter,
-  sourceIds?: string[],
-): Promise<number | null> {
-  if (!sourceIds) return countBacklog(engine);
-  let total = 0;
-  for (const id of sourceIds) {
-    const n = await countBacklog(engine, id);
-    if (n === null) return null;
-    total += n;
-  }
-  return total;
-}
-
 function buildExtractAtomsDrainCommand(
   bySource: Array<{ source_id: string; backlog: number }> | null,
 ): string {
@@ -681,14 +666,15 @@ export async function computeExtractAtomsBacklogCheck(
 
     const { resolvePackPhaseGate } = await import('../../../core/cycle.ts');
     const { extractAtomsPhaseStaleWarning } = await import('../../../core/cycle/extract-atoms-stamp.ts');
+    const excluded = await policyExcludedAtomPages(engine, opts.sourceIds);
     const gate = await resolvePackPhaseGate(engine, 'extract_atoms').catch(() => ({ declared: false, consent_required: false }));
     const declared = gate.declared && !gate.consent_required;
 
     if (backlog === 0) {
       return {
         name, status: 'ok',
-        message: 'no pages awaiting atom extraction',
-        details: { backlog, pack_declares_phase: declared, known_approximation: approx },
+        message: excluded ? `No eligible pages awaiting atom extraction; ${excluded} excluded by source policy.` : 'no pages awaiting atom extraction',
+        details: { policy_excluded_pages: excluded, backlog, pack_declares_phase: declared, known_approximation: approx },
       };
     }
 
@@ -700,7 +686,7 @@ export async function computeExtractAtomsBacklogCheck(
       return {
         name, status: 'warn',
         message: `${backlog} pages eligible for atom extraction but the active pack does not run extract_atoms — backlog growing. Fix: ${fix}`,
-        details: { backlog, backlog_by_source: backlogBySource ?? undefined, pack_declares_phase: false, fix_hint: fix, known_approximation: approx },
+        details: { policy_excluded_pages: excluded, backlog, backlog_by_source: backlogBySource ?? undefined, pack_declares_phase: false, fix_hint: fix, known_approximation: approx },
       };
     }
 
@@ -721,7 +707,7 @@ export async function computeExtractAtomsBacklogCheck(
         return {
           name, status: 'ok',
           message: `${backlog} page(s) pending; active pack runs extract_atoms each cycle`,
-          details: { backlog, pack_declares_phase: true, cycle_evidence: 'unavailable', known_approximation: approx },
+          details: { policy_excluded_pages: excluded, backlog, pack_declares_phase: true, cycle_evidence: 'unavailable', known_approximation: approx },
         };
       }
       if (evidence && (evidence.state === 'never' || evidence.state === 'stale')) {
@@ -737,7 +723,7 @@ export async function computeExtractAtomsBacklogCheck(
             `nothing appears to run the cycle. Install the scheduler: gbrain autopilot --install. ` +
             `Or drain now: ${drain}`,
           details: {
-            backlog,
+            policy_excluded_pages: excluded, backlog,
             backlog_by_source: backlogBySource ?? undefined,
             pack_declares_phase: true,
             cycle_evidence: evidence.state,
@@ -751,14 +737,14 @@ export async function computeExtractAtomsBacklogCheck(
       if (evidence && evidence.state === 'fresh') {
         const bySource = await countExtractAtomsBacklogBySource(engine, countExtractAtomsBacklog, opts.sourceIds);
         const phaseWarn = bySource ? await extractAtomsPhaseStaleWarning(engine, backlog, bySource, buildExtractAtomsDrainCommand, approx) : null;
-        if (phaseWarn) return { name, status: 'warn', ...phaseWarn };
+        if (phaseWarn) return { name, status: 'warn', ...phaseWarn, details: { ...phaseWarn.details, policy_excluded_pages: excluded } };
       }
       // Pack runs it AND the phase ran recently (or the backlog is small,
       // or evidence is unreadable — fail-open). Informational.
       return {
         name, status: 'ok',
         message: `${backlog} page(s) pending; active pack runs extract_atoms each cycle`,
-        details: { backlog, pack_declares_phase: true, known_approximation: approx },
+        details: { policy_excluded_pages: excluded, backlog, pack_declares_phase: true, known_approximation: approx },
       };
     }
 
@@ -766,7 +752,7 @@ export async function computeExtractAtomsBacklogCheck(
     return {
       name, status: 'ok',
       message: `${backlog} page(s) eligible (below warn threshold; pack does not run extract_atoms)`,
-      details: { backlog, pack_declares_phase: false, known_approximation: approx },
+      details: { policy_excluded_pages: excluded, backlog, pack_declares_phase: false, known_approximation: approx },
     };
   } catch (err) {
     return { name, status: 'warn', message: `extract_atoms_backlog check failed: ${(err as Error).message}` };

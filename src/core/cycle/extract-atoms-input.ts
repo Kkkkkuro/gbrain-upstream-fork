@@ -25,6 +25,21 @@ import { planExtraction, type ExtractionPlan, type StoredWatermark } from '../ex
 import { publicBody } from '../mentions/aliases.ts';
 
 export const DEFAULT_EXTRACT_MAX_INPUT_CHARS = 50_000;
+export const PAGE_DISCOVERY_BUDGET = 50;
+
+export async function resolvePageDiscoveryLimit(engine: BrainEngine): Promise<number> {
+  try {
+    const configured = await engine.getConfig('cycle.extract_atoms.page_discovery_budget');
+    if (configured) {
+      const n = Number(configured);
+      // Ceiling: discovery selects full compiled_truth bodies per row, so an
+      // oversized budget materializes that many pages in one result set.
+      if (Number.isFinite(n) && n > 0) return Math.min(Math.floor(n), 10_000);
+    }
+  } catch { /* keep default */ }
+  return PAGE_DISCOVERY_BUDGET;
+}
+
 export const EXTRACT_MAX_INPUT_CHARS_KEY = 'cycle.extract_atoms.max_input_chars';
 
 /**

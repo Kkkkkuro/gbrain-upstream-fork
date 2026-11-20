@@ -58,6 +58,7 @@
 // sourceId arg — atoms always wrote to 'default' regardless of source,
 // which made the NOT EXISTS guard ineffective on federated brains.
 
+import { AtomSourcePolicyUnavailable, excludedAtomSources } from './atom-source-policy.ts';
 import { observationDateLine, observationDateRule } from '../ai/date-grounding.ts';
 import { isConsumerDateGroundingOn } from '../facts/extract.ts';
 import type { BrainEngine, LinkBatchInput } from '../engine.ts';
@@ -69,7 +70,7 @@ import { createGlobalLlmHaltTracker, haltedClassOf, providerContentBlockReason, 
 import { derivedWriteThrough, reportDerivedWriteThrough } from './derived-write-through.ts';
 import { emptySessionSourceRouting, keepSessionSourceTranscripts, withSessionSourceRouting } from './synthesize-source-routing.ts';
 import { serializeMarkdown } from '../markdown.ts';
-import { DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
+import { PAGE_DISCOVERY_BUDGET, resolvePageDiscoveryLimit, DEFAULT_EXTRACT_MAX_INPUT_CHARS, extractAtomsInput, inputTruncatedLine, recordPartialDisposition, releasePartialDispositions, resolveExtractAtomsInputCap, stampTranscriptTombstone, type ExtractAtomsInput, type ExtractAtomsItem } from './extract-atoms-input.ts';
 import { commitExtractionPlan, readPageWatermark } from '../extraction-watermark.ts';
 import { claudeCliSelfSessionIds } from '../ai/providers/claude-cli-scratch.ts';
 import { BudgetExhausted, BudgetTracker, loadPricingOverrides } from '../budget/budget-tracker.ts';
@@ -136,7 +137,6 @@ const LEGACY_EXTRACTABLE_TYPES = [
 // extractable:true flag being a documented forward-compat marker.
 const SYNTHESIS_OUTPUT_TYPES = new Set<string>(['atom', 'concept']);
 
-const PAGE_DISCOVERY_BUDGET = 50;
 const MIN_PAGE_CHARS_FOR_EXTRACTION = 500;
 /** `compiled_truth` has >= `param` characters: octet_length reads a TOASTed size from its header and a character is
  *  1-4 bytes, so only bodies of param..4x param bytes are decompressed (length() decompressed all: 1.3 s at 50k). */
@@ -411,6 +411,7 @@ export async function discoverExtractablePages(
   affectedSlugs?: string[],
   limit: number = PAGE_DISCOVERY_BUDGET,
 ): Promise<AtomPageInput[]> {
+  if ((await excludedAtomSources(engine)).includes(sourceId)) return [];
   const hasFilter = Array.isArray(affectedSlugs) && affectedSlugs.length > 0;
   const connectorExclusion = await connectorAtomExclusionSql(engine);
   const sql = `
@@ -497,7 +498,7 @@ export async function discoverExtractablePages(
 export async function countExtractAtomsBacklog(
   engine: BrainEngine,
   sourceId?: string,
-  opts: { signal?: AbortSignal } = {},
+  opts: { signal?: AbortSignal; excludedOnly?: boolean } = {},
 ): Promise<number | null> {
   try {
     // Two modes: scoped (the phase's per-source `remaining`) vs brain-wide
@@ -505,6 +506,8 @@ export async function countExtractAtomsBacklog(
     // The atom must live in the SAME source as the page either way, so the
     // brain-wide form keys the NOT EXISTS on `atom.source_id = p.source_id`.
     const scoped = sourceId !== undefined;
+    const excluded = await excludedAtomSources(engine);
+    if (scoped && excluded.includes(sourceId!) !== (opts.excludedOnly === true)) return 0;
     const connectorExclusion = await connectorAtomExclusionSql(engine);
     const sql = scoped
       ? `SELECT COUNT(*) AS cnt FROM pages p
@@ -528,6 +531,7 @@ export async function countExtractAtomsBacklog(
            )`
       : `SELECT COUNT(*) AS cnt FROM pages p
          WHERE p.type = ANY($1::text[])
+           AND (p.source_id = ANY($4::text[])) = $5::boolean
            AND p.deleted_at IS NULL
            AND p.content_hash IS NOT NULL
            AND COALESCE(p.frontmatter->>'imported_from',   '') <> 'markdown-greenfield'
@@ -548,7 +552,7 @@ export async function countExtractAtomsBacklog(
     const maxInputChars = await resolveExtractAtomsInputCap(engine);
     const params = scoped
       ? [sourceId, extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION, maxInputChars]
-      : [extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION, maxInputChars];
+      : [extractableTypes, MIN_PAGE_CHARS_FOR_EXTRACTION, maxInputChars, excluded, opts.excludedOnly === true];
     const rows = await engine.executeRaw<{ cnt: string | number }>(sql, params, { signal: opts.signal });
     return Number(rows[0]?.cnt ?? 0);
   } catch (err) {
@@ -556,19 +560,6 @@ export async function countExtractAtomsBacklog(
     console.error(`[extract_atoms] backlog count failed: ${msg}`);
     return null;
   }
-}
-
-async function resolvePageDiscoveryLimit(engine: BrainEngine): Promise<number> {
-  try {
-    const configured = await engine.getConfig('cycle.extract_atoms.page_discovery_budget');
-    if (configured) {
-      const n = Number(configured);
-      // Ceiling: discovery selects full compiled_truth bodies per row, so an
-      // oversized budget materializes that many pages in one result set.
-      if (Number.isFinite(n) && n > 0) return Math.min(Math.floor(n), 10_000);
-    }
-  } catch { /* keep default */ }
-  return PAGE_DISCOVERY_BUDGET;
 }
 
 /**
@@ -709,6 +700,8 @@ export async function runPhaseExtractAtoms(
   opts: ExtractAtomsOpts = {},
 ): Promise<PhaseResult> {
   const sourceId = opts.sourceId ?? 'default';
+  if ((await excludedAtomSources(engine)).includes(sourceId)) return { phase: 'extract_atoms', status: 'skipped', duration_ms: 0,
+    summary: 'Source excluded from provider-based atom extraction by the operator.', details: { reason: 'source_excluded' } };
   const guestSkip = await (await import('../guests/derived.ts')).guestSourceSkip(engine, 'extract_atoms', sourceId);
   if (guestSkip) return { phase: 'extract_atoms', status: 'skipped', duration_ms: 0, summary: `extract_atoms: ${guestSkip.summary}`, details: guestSkip.details };
   if (await (await import('../storage-manifest/door.ts')).isStorageManifestSource(engine, sourceId)) return { phase: 'extract_atoms', status: 'skipped', duration_ms: 0, summary: `extract_atoms: source ${sourceId} is the storage shelf, which holds archive records, not pages to extract atoms from`, details: { reason: 'storage_manifest_source' } };
@@ -1093,7 +1086,9 @@ export async function runPhaseExtractAtoms(
     }
   }
 
+  const chatDefaults = { model: extractModel, maxTokens: maxOutputTokens, responseSchema: ATOMS_RESPONSE_SCHEMA, abortSignal: opts.signal };
   let stoppedEarly = false;
+  let policyStopped = false;
   await withBudgetTracker(budgetTracker, async () => {
   for (const item of work) {
     if (opts.signal?.aborted || opts.stopSignal?.aborted) { stoppedEarly = true; break; }
@@ -1125,15 +1120,14 @@ export async function runPhaseExtractAtoms(
       if (resumed === 'held') { heldFailed++; continue; } // #6325: settled after repeated failures; doctor lists it
       // GBRA-161: a complete read whose result for this same input and policy is already held is not computed again.
       if (!opts.dryRun && !truncated && await heldForInput(engine, atomGenerationOrigin(sourceId, item).key, origin ? atomOriginPin(origin) : atomInputPin(item))) { duplicatesSkipped++; continue; }
+      if ((await excludedAtomSources(engine)).includes(sourceId)) {
+        policyStopped = true;
+        break;
+      }
       const cutLine = truncated ? inputTruncatedLine(originLabel, input, maxInputChars) : null; // A7: a complete appended-tail read prints nothing
       if (cutLine) { inputTruncated++; console.error(cutLine); } // counted only for a model call
 
-      const result = await chat({
-        model: extractModel,
-        ...atomsPrompt(dateGrounding, originLabel, promptContent),
-        maxTokens: maxOutputTokens, responseSchema: ATOMS_RESPONSE_SCHEMA,
-        abortSignal: opts.signal,
-      });
+      const result = await chat({ ...chatDefaults, ...atomsPrompt(dateGrounding, originLabel, promptContent) });
       // Post-await yield: closes the "long LLM call past TTL" hazard
       // codex flagged. The 30s throttle inside maybeYield bounds the
       // actual refresh rate so this is cheap when calls are fast.
@@ -1340,6 +1334,7 @@ export async function runPhaseExtractAtoms(
       // Reporter rate-limits to ~1 line/sec; safe to tick every iter.
       opts.progress?.tick(1, `${totalAtomsExtracted} atoms / ${duplicatesSkipped} skipped`);
     } catch (err) {
+      if (err instanceof AtomSourcePolicyUnavailable) throw err;
       if (err instanceof OperationError && err.writeRequest) writeRequests.push(err.writeRequest);
       if (acceptedPendingReceipt(err)) { writesPending++; continue; }
       if (opts.signal?.aborted) {
@@ -1431,7 +1426,7 @@ export async function runPhaseExtractAtoms(
       kind: 'atoms',
       source_id: sourceId,
       cost_delta: estimatedSpendUsd,
-      ...classifyRunStop({ deadline_hit: stoppedEarly, error: hardFailureCount > 0 ? providerHaltReason(abortedGlobalError) ?? 'item_error' : false }),
+      ...(policyStopped && hardFailureCount === 0 ? {} : classifyRunStop({ deadline_hit: stoppedEarly, error: hardFailureCount > 0 ? providerHaltReason(abortedGlobalError) ?? 'item_error' : false })),
     });
   }
 
@@ -1440,7 +1435,7 @@ export async function runPhaseExtractAtoms(
     // A phase that skipped every work item and produced nothing did not
     // succeed, even though skips are not failures and leave failures[] empty.
     // Reporting 'ok' there hides a total no-op behind a green status.
-    status:
+    status: policyStopped && failures.length === 0 ? 'skipped' :
       failures.length > 0 ||
       (work.length > 0 &&
         totalAtomsExtracted === 0 &&
@@ -1449,6 +1444,7 @@ export async function runPhaseExtractAtoms(
         : 'ok',
     duration_ms: 0,
     summary:
+      (policyStopped ? 'Source excluded by the operator during this run. ' : '') +
       `extract_atoms: ${totalAtomsExtracted} atoms from ` +
       `${transcriptsProcessed}/${transcripts.length} transcripts + ` +
       `${pagesProcessed}/${pages.length} pages` +
@@ -1458,6 +1454,7 @@ export async function runPhaseExtractAtoms(
         : '') +
       (inputTruncated > 0 ? ` (${inputTruncated} input-truncated: the model did not read the tail)` : ''),
     details: {
+      ...(policyStopped ? { reason: 'source_excluded' } : {}),
       atoms_extracted: totalAtomsExtracted,
       transcripts_processed: transcriptsProcessed,
       transcripts_total: transcripts.length,

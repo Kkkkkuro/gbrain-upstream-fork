@@ -99,6 +99,26 @@ describe('parseAtomsOutcome — typed parse (gbrain#4148)', () => {
 });
 
 describe('runPhaseExtractAtoms — failure classes (gbrain#4148)', () => {
+  test('an exclusion set between two items stops the next provider call without recording a content failure', async () => {
+    await seedPage('note/first');
+    await seedPage('note/second');
+    let calls = 0;
+    const result = await runPhaseExtractAtoms(engine, {
+      sourceId: 'default', _transcripts: [],
+      _pages: ['first', 'second'].map((slug, i) => ({ slug: 'note/' + slug, content: 'Example ' + slug, contentHash: (i ? 'b' : 'a').repeat(16) })),
+      _chat: async () => {
+        calls++;
+        await engine.setConfig('cycle.extract_atoms.excluded_sources', '["default"]');
+        return okChatResult('[]');
+      },
+    });
+    expect(calls).toBe(1);
+    expect(result.details.reason).toBe('source_excluded');
+    expect(result.details.pages_processed).toBe(1);
+    expect(result.details.failures).toEqual([]);
+    expect(await stateOf('note/second')).toBeUndefined();
+  });
+
   test('provider content block counts by content and tombstones without stopping other pages', async () => {
     await engine.putPage('meetings/blocked', {
       title: 'blocked meeting', type: 'meeting', compiled_truth: 'blocked prose '.repeat(60),

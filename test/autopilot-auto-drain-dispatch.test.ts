@@ -105,6 +105,14 @@ test('six backlogged git sources and one connector source under the default cap:
   expect(jobs.find(j => j.source === 'git-1')!.repo).toBe(join(home, 'git-1'));
 });
 
+test('a retrieval-only source is never enqueued; another source with the same backlog is submitted', async () => {
+  await gitSource('reports');
+  await gitSource('reference');
+  await engine.setConfig('cycle.extract_atoms.excluded_sources', '["reports"]');
+  await tick();
+  expect((await submitted()).map(row => row.source)).toEqual(['reference']);
+});
+
 test('one slot left with a git and a connector source: the git source is submitted, the connector goes first next day', async () => {
   await engine.setConfig('autopilot.auto_drain.max_usd_per_day', '0.3');
   await gitSource('git-a');

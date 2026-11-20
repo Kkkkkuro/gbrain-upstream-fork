@@ -20,7 +20,7 @@ import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
-import { countExtractAtomsBacklog } from '../src/core/cycle/extract-atoms.ts';
+import { countExtractAtomsBacklog, discoverExtractablePages, runPhaseExtractAtoms } from '../src/core/cycle/extract-atoms.ts';
 import { computeExtractAtomsBacklogCheck } from '../src/commands/doctor.ts';
 import { addSource } from '../src/core/sources-ops.ts';
 import { __setPackLocatorForTests, _resetPackLocatorForTests } from '../src/core/schema-pack/load-active.ts';
@@ -56,6 +56,45 @@ describe('countExtractAtomsBacklog (issue #1678)', () => {
     await seedArticle('article-c');
     expect(await countExtractAtomsBacklog(engine)).toBe(3);
     expect(await countExtractAtomsBacklog(engine, 'default')).toBe(3);
+  });
+
+  it('retains retrieval-only pages, keeps the real backlog visible, and sends no excluded pages or transcripts', async () => {
+    await addSource(engine, { id: 'reports' });
+    await seedArticle('article-eligible');
+    await seedArticle('article-retained', 'reports');
+    expect(await countExtractAtomsBacklog(engine)).toBe(2);
+    await engine.setConfig('cycle.extract_atoms.excluded_sources', '["reports"]');
+    expect(await countExtractAtomsBacklog(engine)).toBe(1);
+    expect(await countExtractAtomsBacklog(engine, 'reports')).toBe(0);
+    expect(await discoverExtractablePages(engine, 'reports')).toEqual([]);
+    expect((await engine.getPage('article-retained', { sourceId: 'reports' }))?.compiled_truth).toBe(BODY);
+    let calls = 0;
+    const result = await runPhaseExtractAtoms(engine, { sourceId: 'reports',
+      _transcripts: [{ filePath: 'meeting.txt', content: BODY, contentHash: 'a'.repeat(64) }],
+      _pages: [{ slug: 'article-retained', content: BODY, contentHash: 'b'.repeat(64) }],
+      _chat: async () => { calls++; throw new Error('excluded provider call'); } });
+    expect(result.status).toBe('skipped');
+    expect(result.details?.reason).toBe('source_excluded');
+    expect(calls).toBe(0);
+    const doctor = await computeExtractAtomsBacklogCheck(engine);
+    expect(doctor.details?.policy_excluded_pages).toBe(1);
+    const scoped = await computeExtractAtomsBacklogCheck(engine, { sourceIds: ['default'] });
+    expect(scoped.details?.policy_excluded_pages ?? 0).toBe(0);
+    const remote = await computeExtractAtomsBacklogCheck(engine, { sourceIds: ['reports'] });
+    expect(remote.details?.backlog).toBe(0);
+    expect(remote.details?.policy_excluded_pages).toBe(1);
+    await engine.setConfig('cycle.extract_atoms.excluded_sources', '[]');
+    expect(await countExtractAtomsBacklog(engine)).toBe(2);
+  });
+
+  it('rejects a malformed stored policy before calling the provider and reports an unknown backlog', async () => {
+    await seedArticle('article-retained');
+    await engine.setConfig('cycle.extract_atoms.excluded_sources', 'not-json');
+    let calls = 0;
+    await expect(runPhaseExtractAtoms(engine, { _chat: async () => { calls++; throw new Error('unexpected provider'); } })).rejects.toThrow('source policy');
+    expect(calls).toBe(0);
+    expect(await countExtractAtomsBacklog(engine)).toBeNull();
+    expect((await computeExtractAtomsBacklogCheck(engine)).status).toBe('warn');
   });
 
   it('excludes a page that already has a matching atom (NOT EXISTS)', async () => {
