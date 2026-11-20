@@ -188,6 +188,27 @@ async function refreshSourcePath(engine: BrainEngine, slug: string, sourceId: st
   }
 }
 
+interface ImportOrigin {
+  /** Attributed by the coordinator. Screening still receives the current request's channel. */
+  preserveStoredIngestOrigin?: boolean;
+  source_kind?: string | null;
+  source_uri?: string | null;
+  ingested_via?: string | null;
+}
+
+function originForPageWrite(origin: ImportOrigin, existing: Page | null, fileUri: string | null) {
+  // A non-null channel makes putPage advance the server-owned ingest timestamp.
+  // Null values preserve the first ingest, while the request records the later edit.
+  if (existing && origin.preserveStoredIngestOrigin) {
+    return { source_kind: null, source_uri: null, ingested_via: null };
+  }
+  return {
+    source_kind: origin.source_kind ?? null,
+    source_uri: origin.source_uri ?? fileUri,
+    ingested_via: origin.ingested_via ?? null,
+  };
+}
+
 /** #6188 (E8): `importFromContent`'s fence options. */
 interface ImportFenceOptions {
   /** A residual fence refuses typed (`coordinated`) or is stored with a warning (`lenient`, default); a fixable one is normalized. */
@@ -267,19 +288,6 @@ export async function importFromContent(
      * NEVER per file inside sync (codex perf finding #7).
      */
     activePack?: ParseOpts['activePack'];
-    /**
-     * v0.39.3.0 provenance write-through (WARN-8). When set, threaded to
-     * `tx.putPage` so the page's `source_kind`, `source_uri`,
-     * `ingested_via` DB columns get populated. The trust gate lives at the
-     * `put_page` op layer — by the time importFromContent sees these, the
-     * caller is already trusted (capture CLI sets them; remote MCP callers
-     * had theirs overridden to `mcp:put_page` upstream). `ingested_at` is
-     * NOT a caller-controllable param; the engine's putPage stamps it
-     * server-side via now() when any provenance write fires.
-     */
-    source_kind?: string | null;
-    source_uri?: string | null;
-    ingested_via?: string | null;
     /** Wave B: who stages a segmented body (the journaled request's principal); unset: the local maintenance principal, kind `import`. */
     segmentedOwner?: SegmentedStagingOwner;
     /** Wave B: a segmented body an earlier preparation of this write staged (`PreparedContentImport.segmented`), reused when its inputs are unchanged. */
@@ -315,7 +323,7 @@ export async function importFromContent(
     /** GST-2112: the revision (null: no page) a caller's check read; a different base refuses `revision_conflict`, and the write transaction re-proves the base. */
     expectedBaseRevision?: string | null;
     onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void;
-  } & ImportFenceOptions = {},
+  } & ImportFenceOptions & ImportOrigin = {},
 ): Promise<ImportResult> {
   // Normalize BEFORE any tx write: putPage lowercases via validateSlug but
   // upsertChunks used to query by the caller's raw slug, so a mixed-case slug
@@ -495,6 +503,7 @@ export async function importFromContent(
     };
 
     const originUri = fileOriginUri(existing?.source_uri, opts.sourceRoot, opts.sourcePath);
+    const storedOrigin = originForPageWrite(opts, existing, originUri);
     const persistUnchanged = async (refreshBody = false) => {
       return maintenanceTransaction(engine, async tx => {
         await assertImportBase(tx, slug, sourceId ?? 'default', existing);
@@ -741,7 +750,7 @@ export async function importFromContent(
         async () => {
           if (segmented) return segmented.apply(tx, { type: parsed.type, title: parsed.title, frontmatter: parsed.frontmatter, page_kind: 'markdown',
             effective_date: effectiveDate, effective_date_source: effectiveDateSource, import_filename: filenameForChain, source_path: opts.sourcePath ?? null,
-            source_kind: opts.source_kind ?? null, source_uri: opts.source_uri ?? originUri, ingested_via: opts.ingested_via ?? null }, { mode: effectiveCRMode, corpusGeneration });
+            ...storedOrigin }, { mode: effectiveCRMode, corpusGeneration });
           written = await tx.putPage(slug, {
             type: parsed.type,
             title: parsed.title,
@@ -757,9 +766,7 @@ export async function importFromContent(
             // v0.39.3.0 provenance write-through (WARN-8). Engine layer applies
             // COALESCE-preserve UPDATE so omitting these on a later put_page
             // doesn't erase the original ingestion's audit trail.
-            source_kind: opts.source_kind ?? null,
-            source_uri: opts.source_uri ?? originUri,
-            ingested_via: opts.ingested_via ?? null,
+            ...storedOrigin,
             // ingested_at is server-stamped at the engine layer when any
             // provenance write fires; never client-controlled.
             // Empty-overwrite escape hatch only when the caller vouched (file

@@ -203,6 +203,15 @@ function putProvenance(row: WriteRequest, snapshot: PageSnapshot | null, parsed:
 function serverOwnsProvenance(row: WriteRequest): boolean {
   return (row.operation === 'put_page' && !!row.worktree_id) || (row.authority.remote === true && CALLER_CONTENT_OPERATIONS.includes(row.operation));
 }
+function importOriginForRequest(row: WriteRequest) {
+  const intent = row.intent;
+  return {
+    preserveStoredIngestOrigin: serverOwnsProvenance(row),
+    source_kind: typeof intent?.source_kind === 'string' ? intent.source_kind : null,
+    source_uri: typeof intent?.source_uri === 'string' ? intent.source_uri : null,
+    ingested_via: typeof intent?.ingested_via === 'string' ? intent.ingested_via : null,
+  };
+}
 /**
  * #7873: the tier of a write whose provenance stamps are server-owned is the lower of its own frontmatter's and the
  * frontmatter it publishes (the stored stamps kept), so dropping a stored lowering stamp escapes neither the write gate
@@ -1186,9 +1195,7 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
     preserveGateMarkers: !row.authority.remote && (p.kind === 'managed_maintenance_page' || p.kind === 'managed_quarantine_clear'),
     forceRechunk: row.operation === 'restore_page' || row.operation === 'revert_version',
     allowEmptyOverwrite: p.allow_empty === true || row.operation === 'restore_page' || row.operation === 'revert_version',
-    source_kind: typeof p.source_kind === 'string' ? p.source_kind : null,
-    source_uri: typeof p.source_uri === 'string' ? p.source_uri : null,
-    ingested_via: typeof p.ingested_via === 'string' ? p.ingested_via : null,
+    ...importOriginForRequest(row),
     ...(gateTrust ? { writeGate: gateInput(gateTrust, row.id) } : {}),
     // Provenance compares the caller's page with the stored one, so it runs before the server's trust marker is stamped.
     prepareFrontmatter: page => {

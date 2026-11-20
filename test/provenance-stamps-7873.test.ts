@@ -88,7 +88,7 @@ for (const kind of testBackends()) {
       const seed = async (slug: string, frontmatter: Record<string, unknown>, tier: string) => {
         const write = async (tx: BrainEngine) => {
           await tx.putPage(slug, { type: 'note', title: 'Seeded', compiled_truth: 'Captured body', timeline: '', frontmatter,
-            source_kind: 'webhook', ingested_via: 'webhook' } as never);
+            source_kind: 'webhook', source_uri: 'urn:example:original-document', ingested_via: 'webhook' } as never);
           await tx.executeRaw('UPDATE pages SET trust_tier = $1, ingested_at = $4::timestamptz WHERE source_id = $2 AND slug = $3', [tier, 'default', slug, STORED.ingested_at]);
         };
         await (repo && kind === 'postgres' ? withManagedFixtureWrite(engine, ['default'], write) : write(engine));
@@ -106,6 +106,35 @@ for (const kind of testBackends()) {
       };
       const forgeAll = (): Array<[string, string]> => [['source_kind: webhook', `source_kind: ${FORGED.source_kind}`],
         ['ingested_via: webhook', `ingested_via: ${FORGED.ingested_via}`], [`ingested_at: '${STORED.ingested_at}'`, `ingested_at: '${FORGED.ingested_at}'`]];
+
+      test('ordinary remote content changes preserve the original ingest columns', async () => {
+        const slug = 'inbox/original-ingest-example';
+        await seed(slug, STORED, 'external_untrusted');
+        const origin = async () => {
+          const [value] = await engine.executeRaw<Record<string, unknown>>(
+            'SELECT source_kind, source_uri, ingested_via, ingested_at::text AS ingested_at FROM pages WHERE source_id=$1 AND slug=$2',
+            ['default', slug]);
+          return value;
+        };
+        const original = await origin();
+        expect(original).toMatchObject({ source_kind: 'webhook', source_uri: 'urn:example:original-document' });
+        await edit(slug, [['Captured body', 'Updated text']]);
+        expect((await page(slug)).page.compiled_truth).toContain('Updated text');
+        expect(await origin()).toEqual(original);
+        await call('append_page', { slug, text: 'Additional line', request_id: crypto.randomUUID(), expected_revision: (await read(slug)).revision });
+        expect((await page(slug)).page.compiled_truth).toContain('Additional line');
+        expect(await origin()).toEqual(original);
+        expect(stampsOf((await page(slug)).page.frontmatter)).toEqual(STORED);
+        if (kind === 'postgres' && repo) {
+          const receipts = await engine.executeRaw<{ operation: string; state: string }>(
+            'SELECT operation, state FROM persistence_requests WHERE source_id=$1 AND slug=$2 ORDER BY sequence',
+            ['default', slug]);
+          expect(receipts).toEqual([
+            { operation: 'edit_page', state: 'committed' },
+            { operation: 'append_page', state: 'committed' },
+          ]);
+        }
+      });
 
       test('a remote edit_page keeps the stored stamps in the file and the database, and the page does not re-derive higher', async () => {
         const slug = 'inbox/edit-stamps';
