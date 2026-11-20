@@ -298,6 +298,7 @@ export const RUST_ENGINE_MEMBERS = {
   readPersistenceBrainId: 'persistence_journal',
   readLocalWriterRow: 'persistence_journal',
   insertLocalWriterRow: 'persistence_journal',
+  firstIngestProjection: 'persistence_journal',
   readLedgerSource: 'persistence_journal',
   // access_control
   isFolderRestricted: 'access_control',

@@ -39,6 +39,7 @@ import { heldPrivacyLabels, queueTierProjection, recordAgentPageLowering, withLa
 import { plannedDigest, readPageDrift } from './provenance-drift.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { OperationContext } from '../ops/contract.ts';
+import { restoreFirstIngestProjection } from './first-ingest-projection.ts';
 import { opError } from '../ops/contract.ts';
 import type { PreparedMutation } from '../persistence/coordinator.ts';
 import type { Principal, WriteRequest } from '../persistence/model.ts';
@@ -202,7 +203,7 @@ export interface PageActionResult {
 }
 
 type OwnerPageIntent = {
-  mode: 'confirm' | 'revert' | 'repair_marker' | 'restore_provenance' | 'write_labels';
+  mode: 'confirm' | 'revert' | 'repair_marker' | 'restore_provenance' | 'restore_first_ingest' | 'write_labels';
   expected_revision: string;
   /** GST-2518: confirm and write_labels write these privacy labels (null removes a key); write_labels keeps the page at most at `tier`. */
   labels?: Record<string, unknown>;
@@ -262,7 +263,7 @@ export async function confirmPage(engine: BrainEngine, input: PageActionInput): 
 export const repairedMarker = (tier: TrustTier): TrustTier | null => compareTrust(tier, OWNER_TIER_FLOOR) >= 0 ? null : tier;
 
 const ACTION_NAMES: Record<OwnerPageIntent['mode'], string> = { confirm: 'its confirmation', revert: 'the revert', repair_marker: 'the marker repair', restore_provenance: 'the provenance restore',
-  write_labels: 'the label change' };
+  restore_first_ingest: 'the first ingest projection repair', write_labels: 'the label change' };
 /** GST-2518: the keys an owner page intent may write as labels. */
 const LABEL_KEYS = ['visibility', 'access', 'confidentiality', 'readable_by'];
 
@@ -282,7 +283,7 @@ export async function writePageLabels(engine: BrainEngine, input: PageActionInpu
   return { status: 'restored', ref, tier, prior_tier: state.tier };
 }
 /** Owner page modes only the trusted local CLI may run. */
-const LOCAL_ONLY_MODES: ReadonlyArray<OwnerPageIntent['mode']> = ['repair_marker', 'restore_provenance'];
+const LOCAL_ONLY_MODES: ReadonlyArray<OwnerPageIntent['mode']> = ['repair_marker', 'restore_provenance', 'restore_first_ingest'];
 
 /** #6550: rewrites the page's marker to `repairedMarker(stored tier)`, bound to the previewed revision; the row keeps its tier. */
 export async function repairPageMarker(engine: BrainEngine, input: PageActionInput): Promise<PageActionResult & { marker: TrustTier | null }> {
@@ -318,6 +319,11 @@ export async function restorePageProvenance(engine: BrainEngine, input: PageActi
   const { content, tier } = await plannedProvenanceRestore(engine, state, intent);
   await publishOwnerPage(engine, input, intent, content, tier);
   return { status: 'restored', ref, tier, prior_tier: state.tier };
+}
+
+export async function repairFirstIngestProjection(engine: BrainEngine, input: PageActionInput & { planned: string }): Promise<void> {
+  await submitOwnerPage(engine, input, { mode: 'restore_first_ingest', expected_revision: input.expectedRevision,
+    via: input.confirmation.via, planned: input.planned });
 }
 
 /** The tier a version restores: its snapshot tier, `unknown` for legacy versions. */
@@ -485,6 +491,12 @@ export async function prepareTrustOwnerPageMutation(engine: BrainEngine, row: Wr
   const ref = pageRef(row.source_id, row.slug);
   const state = await readPageTrustState(engine, row.source_id, row.slug);
   if (!state || state.revision !== intent.expected_revision) throw changedSincePreview(ref, ACTION_NAMES[intent.mode]);
+  if (intent.mode === 'restore_first_ingest') {
+    const planned = intent.planned;
+    if (typeof planned !== 'string' || !row.worktree_id || intent.via !== 'preview_hash') throw changedSincePreview(ref, ACTION_NAMES.restore_first_ingest);
+    // The canonical file and page revision are unchanged. Publish only the corrected projection and its request receipt.
+    return { observedRevision: state.revision, noop: true, databaseOnlyReason: 'committed_file', apply: tx => restoreFirstIngestProjection(tx, row.source_id, row.slug, planned) };
+  }
   let content: string;
   let tags: string[] | undefined;
   let tier: TrustTier = 'user_confirmed';

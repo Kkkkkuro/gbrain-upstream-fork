@@ -27,6 +27,7 @@ import { withTrustPromotion, withWriteAttribution } from '../src/core/persistenc
 import type { WriteAttribution } from '../src/core/persistence/attribution.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { writeGitHold } from '../src/core/persistence/sync-holds.ts';
+import { registerLocalWriter, withVerifiedLocalRegistration } from '../src/core/persistence/identity.ts';
 import { resolveRepairScope } from '../src/core/repair/core.ts';
 import { AUTO_REPAIR_REGISTRY, repairRunner } from '../src/core/repair/registry.ts';
 import { analyzePageDrift } from '../src/core/trust/provenance-drift.ts';
@@ -360,6 +361,67 @@ for (const kind of testBackends()) {
     };
     const repair = (engine: BrainEngine, apply: boolean, expect?: string) => (async () => (await repairRunner(engine, { apply, logger }))
       .run('provenance', await resolveRepairScope(engine, 'default'), { explicit: true, sourceFlag: 'default', ...(expect ? { expect } : {}) }))() as Promise<Record<string, any>>;
+
+    for (const timeline of [false, true]) test(`a verified creation receipt restores only the projected first-ingest columns (later timeline: ${timeline})`, () => managedBrain(async ({ engine, ctx, root }) => {
+      const slug = 'inbox/first-ingest';
+      const put = await operationsByName.put_page.handler(ctx, { slug, content: '---\ntype: note\ntitle: Source log\n---\nOriginal text\n' }) as { revision: string };
+      const original = await engine.readPageSnapshot(slug, { sourceId: 'default' });
+      const registration = await registerLocalWriter(engine, 'stdio', { sourceIds: ['default'], operations: null, scopes: ['read', 'write'], slugPrefixes: ['inbox'] });
+      await withVerifiedLocalRegistration(engine, registration, () => operationsByName.edit_page.handler({ ...ctx, remote: true }, {
+        slug, expected_revision: put.revision, request_id: randomUUID(), edits: [{ old_text: 'Original text', new_text: 'Edited text' }],
+      }));
+      await settleManagedGitEffects(engine);
+      // Model a database created by a release that restamped the row on an edit.
+      await withManagedFixtureWrite(engine, ['default'], tx => tx.executeRaw(
+        "UPDATE pages SET source_kind='mcp:edit_page',ingested_via='mcp:edit_page',ingested_at=now() WHERE source_id='default' AND slug=$1", [slug]));
+      if (timeline) {
+        const live = await engine.readPageSnapshot(slug, { sourceId: 'default' });
+        await withVerifiedLocalRegistration(engine, registration, () => operationsByName.add_timeline_entry.handler({ ...ctx, remote: true }, {
+          slug, date: '2026-01-02', summary: 'Recorded after the edit', expected_revision: live!.revision, request_id: randomUUID(),
+        }));
+        await settleManagedGitEffects(engine);
+      }
+      const state = async () => (await engine.executeRaw(
+        "SELECT knowledge_revision::text, revision_write_request_id::text, trust_tier, write_origin, compiled_truth, timeline, frontmatter, source_uri FROM pages WHERE source_id='default' AND slug=$1", [slug]))[0];
+      const before = await state();
+      const file = fs.readFileSync(path.join(root, slug + '.md'));
+      const versions = async () => engine.executeRaw('SELECT v.id, v.knowledge_revision FROM page_versions v JOIN pages p ON p.id=v.page_id WHERE p.slug=$1 ORDER BY v.id', [slug]);
+      const history = await versions();
+      const dry = await repair(engine, false);
+      expect(dry.listing.map((entry: { class: string }) => entry.class)).toEqual(['first_ingest_projection']);
+      fs.appendFileSync(path.join(root, slug + '.md'), 'Pending hand edit\n');
+      expect((await repair(engine, false)).listing[0].class).toBe('needs_review');
+      await expect(repair(engine, true, dry.preview_hash)).rejects.toMatchObject({ code: 'preview_changed' });
+      expect(await state()).toEqual(before);
+      fs.writeFileSync(path.join(root, slug + '.md'), file);
+      const storage = await engine.firstIngestProjection('default', slug);
+      await expect(withManagedFixtureWrite(engine, ['default'], async tx => {
+        expect(await tx.firstIngestProjection('default', slug, storage!.planned)).not.toBeNull();
+        expect(await tx.firstIngestProjection('default', slug)).toBeNull();
+        throw new Error('rollback fixture');
+      })).rejects.toThrow('rollback fixture');
+      expect(await engine.firstIngestProjection('default', slug)).toEqual(storage);
+      await withManagedFixtureWrite(engine, ['default'], tx => tx.executeRaw(
+        "UPDATE pages SET version_history_gap_at=now() WHERE source_id='default' AND slug=$1", [slug]));
+      expect((await repair(engine, false)).affected).toBe(0);
+      await expect(repair(engine, true, dry.preview_hash)).rejects.toMatchObject({ code: 'preview_changed' });
+      expect(await state()).toEqual(before);
+      await withManagedFixtureWrite(engine, ['default'], tx => tx.executeRaw(
+        "UPDATE pages SET version_history_gap_at=NULL WHERE source_id='default' AND slug=$1", [slug]));
+      expect(dry.affected).toBe(1);
+      expect((await repair(engine, true, dry.preview_hash)).applied).toBe(1);
+      const after = (await engine.readPageSnapshot(slug, { sourceId: 'default' }))!.page;
+      for (const key of ['source_kind','ingested_via','ingested_at'] as const) expect(after[key]).toEqual(original!.page[key]);
+      expect(await state()).toEqual(before);
+      expect(await versions()).toEqual(history);
+      expect(fs.readFileSync(path.join(root, slug + '.md'))).toEqual(file);
+      expect((await repair(engine, false)).affected).toBe(0);
+      await expect(repair(engine, true, dry.preview_hash)).rejects.toMatchObject({ code: 'preview_changed' });
+      expect(await state()).toEqual(before);
+      const receipt = await engine.executeRaw<{state: string; restored: boolean}>(`SELECT state,(outcome->>'first_ingest_projection')::boolean AS restored
+        FROM persistence_requests WHERE source_id='default' AND slug=$1 AND operation='trust_owner_page'`, [slug]);
+      expect(receipt).toEqual([{ state: 'committed', restored: true }]);
+    }, { databaseUrl }), 120_000);
 
     test('apply publishes the restore through the coordinator: the file and the row carry the restored stamps and marker', () => managedBrain(async brain => {
       const { engine, root } = brain;

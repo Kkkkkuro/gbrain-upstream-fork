@@ -59,3 +59,5 @@ export async function insertLocalWriterRow(exec: SqlExecutor, row: LocalWriterIn
     VALUES($1::uuid,$2,$3,$4::text::jsonb) ON CONFLICT DO NOTHING RETURNING id`, [row.id, row.lane, row.credentialHash, JSON.stringify(row.grant)]);
   return inserted.length > 0;
 }
+
+export { firstIngestProjection, type OriginEvidence } from './first-ingest.ts';

@@ -17,7 +17,7 @@ import type { OnboardSignal } from './engine-sql/health.ts';
 import type { EntityTypeFilter } from './schema-pack/entity-types.ts';
 import type { ChunkMove } from './page-state/chunk-moves.ts';
 import type { DerivedAliasRow } from './engine-sql/pages.ts';
-import type { LocalWriterInsert, LocalWriterRow } from './engine-sql/persistence-state.ts';
+import type { LocalWriterInsert, LocalWriterRow, OriginEvidence } from './engine-sql/persistence-state.ts';
 import type { PageBodySizes } from './engine-sql/large-page.ts';
 import type { TimelineDetailRefresh, TimelineRowRemoval } from './engine-sql/timeline.ts';
 import type { TakeFenceRow } from './engine-sql/takes.ts';
@@ -2895,10 +2895,7 @@ export interface BrainEngine {
    */
   getConfigValues(keys: readonly string[]): Promise<Array<{ key: string; value: string }>>;
 
-  /**
-   * The `enabled` value of every `persistence_brain` singleton row, as stored (a healthy brain has exactly one boolean).
-   * Callers decide what a malformed answer means; the direct-write guard refuses it (persistence/managed-mode.ts).
-   */
+  /** All stored managed-mode values. The direct-write guard accepts exactly one boolean (persistence/managed-mode.ts). */
   readManagedModeRows(): Promise<Array<{ enabled: unknown }>>;
 
   /** True when the source's `config.canonical` is `git` (a git-canonical source); false for anything else, including an unknown id. */
@@ -2912,6 +2909,9 @@ export interface BrainEngine {
 
   /** Registers a local writer unless its id or credential hash is already registered; true when this call inserted the row. */
   insertLocalWriterRow(row: LocalWriterInsert): Promise<boolean>;
+
+  /** Local owner maintenance, reads a proven first ingest and restores only an exact preview digest in the publication transaction. */
+  firstIngestProjection(source: string, slug: string, expect?: string): Promise<(OriginEvidence & { planned: string }) | null>;
 
   /**
    * The current value of each named transaction-local setting (`current_setting(name, true)`), in `names` order, null

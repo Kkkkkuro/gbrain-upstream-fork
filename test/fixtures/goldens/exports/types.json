@@ -108,6 +108,7 @@
           "findOrphanPages: (opts?: PageReadScope & { sourceId?: string; sourceIds?: string[]; mode?: \"inbound\" | \"islanded\"; scopeInbound?: boolean; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
           "findPages: (query: FindPagesQuery) => Promise<FoundPages>",
           "findTrajectory: (opts: TrajectoryOpts) => Promise<TrajectoryPoint[]>",
+          "firstIngestProjection: (source: string, slug: string, expect?: string) => Promise<(OriginEvidence & { planned: string; }) | null>",
           "flipBodyGeneration: (input: BodyFlipInput) => Promise<BodyFlipResult>",
           "generatedPagesIn: (ids: number[]) => Promise<GeneratedPageRow[]>",
           "getAdjacencyBoosts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, AdjacencyRow>>",
@@ -1199,6 +1200,7 @@
           "findOrphanPages: (opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; mode?: \"inbound\" | \"islanded\"; scopeInbound?: boolean; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
           "findPages: (query: FindPagesQuery) => Promise<FoundPages>",
           "findTrajectory: (opts: TrajectoryOpts) => Promise<TrajectoryPoint[]>",
+          "firstIngestProjection: (source: string, slug: string, expect?: string) => Promise<{ planned: string; page_id: number; revision: string; incarnation: string; birth_request: string; edit_request: string; current_request: string; first_at: string; current_via: string; current_at: string; } | null>",
           "flipBodyGeneration: (input: BodyFlipInput) => Promise<BodyFlipResult>",
           "generatedPagesIn: (ids: number[]) => Promise<GeneratedPageRow[]>",
           "getAdjacencyBoosts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, AdjacencyRow>>",
@@ -3822,6 +3824,7 @@
           "findOrphanPages: (opts?: PageReadScope & { sourceId?: string; sourceIds?: string[]; mode?: \"inbound\" | \"islanded\"; scopeInbound?: boolean; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
           "findPages: (query: FindPagesQuery) => Promise<FoundPages>",
           "findTrajectory: (opts: TrajectoryOpts) => Promise<TrajectoryPoint[]>",
+          "firstIngestProjection: (source: string, slug: string, expect?: string) => Promise<(OriginEvidence & { planned: string; }) | null>",
           "flipBodyGeneration: (input: BodyFlipInput) => Promise<BodyFlipResult>",
           "generatedPagesIn: (ids: number[]) => Promise<GeneratedPageRow[]>",
           "getAdjacencyBoosts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, AdjacencyRow>>",
@@ -5383,7 +5386,7 @@
         "kind": "function",
         "name": "importFromContent",
         "signature": [
-          "(engine: BrainEngine, slug: string, content: string, opts?: { prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; history?: VersionHistory; coordinated?: boolean; boundedChunkWrites?: true; existingSnapshot?: PageSnapshot | null; prepareFrontmatter?: (page: ParsedPage) => void; noEmbed?: boolean; sourceId?: string; filename?: string; sourcePath?: string; sourceRoot?: string; fileTimes?: { birthtime?: Date; mtime?: Date; firstCommit?: Date; }; forceRechunk?: boolean; activePack?: ParseOpts[\"activePack\"]; source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null; segmentedOwner?: SegmentedStagingOwner; reuseSegments?: SegmentedImport; remote?: boolean; restoreHeldRows?: boolean; preserveGateMarkers?: boolean; allowEmptyOverwrite?: boolean; overrideTier?: unknown; writeGate?: WriteGateInput; holdNoncanonicalPrivate?: boolean; beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>; expectedBaseRevision?: string | null; onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void; } & ImportFenceOptions) => Promise<ImportResult>"
+          "(engine: BrainEngine, slug: string, content: string, opts?: { prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; history?: VersionHistory; coordinated?: boolean; boundedChunkWrites?: true; existingSnapshot?: PageSnapshot | null; prepareFrontmatter?: (page: ParsedPage) => void; noEmbed?: boolean; sourceId?: string; filename?: string; sourcePath?: string; sourceRoot?: string; fileTimes?: { birthtime?: Date; mtime?: Date; firstCommit?: Date; }; forceRechunk?: boolean; activePack?: ParseOpts[\"activePack\"]; segmentedOwner?: SegmentedStagingOwner; reuseSegments?: SegmentedImport; remote?: boolean; restoreHeldRows?: boolean; preserveGateMarkers?: boolean; allowEmptyOverwrite?: boolean; overrideTier?: unknown; writeGate?: WriteGateInput; holdNoncanonicalPrivate?: boolean; beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>; expectedBaseRevision?: string | null; onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void; } & ImportFenceOptions & ImportOrigin) => Promise<ImportResult>"
         ]
       },
       {
@@ -7422,6 +7425,7 @@
           "findOrphanPages: (opts?: { sourceId?: string; sourceIds?: string[]; excludePrivate?: boolean; mode?: \"inbound\" | \"islanded\"; scopeInbound?: boolean; }) => Promise<Array<{ slug: string; title: string; domain: string | null; type?: string | null; quarantined?: boolean; source_id?: string; }>>",
           "findPages: (query: FindPagesQuery) => Promise<FoundPages>",
           "findTrajectory: (opts: TrajectoryOpts) => Promise<TrajectoryPoint[]>",
+          "firstIngestProjection: (source: string, slug: string, expect?: string) => Promise<{ planned: string; page_id: number; revision: string; incarnation: string; birth_request: string; edit_request: string; current_request: string; first_at: string; current_via: string; current_at: string; } | null>",
           "flipBodyGeneration: (input: BodyFlipInput) => Promise<BodyFlipResult>",
           "generatedPagesIn: (ids: number[]) => Promise<searchReadsImpl.GeneratedPageRow[]>",
           "getAdjacencyBoosts: (pageIds: number[], opts?: PageReadScope) => Promise<Map<number, AdjacencyRow>>",

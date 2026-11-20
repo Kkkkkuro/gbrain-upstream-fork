@@ -23,14 +23,15 @@ import { OperationError, opError } from '../ops/contract.ts';
 import { clearApprovedSet, loadApprovedSet, previewChangedError, previewHash, retireAfterLastItem, saveApprovedSet } from '../persistence/preview-approval.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { GIT_HOLD_OP, gitHoldFix, type GitHoldRecord } from '../persistence/sync-holds.ts';
-import { ownerRepairFile, repairPageMarker, restorePageProvenance } from '../trust/page-handlers.ts';
+import { firstIngestEvidence } from '../trust/first-ingest-projection.ts';
+import { ownerRepairFile, repairFirstIngestProjection, repairPageMarker, restorePageProvenance } from '../trust/page-handlers.ts';
 import { plannedDigest, readPageDrift, scanProvenanceDrift, type DriftItem } from '../trust/provenance-drift.ts';
 import { afterCursor, type RepairHandler, type RepairItem, type RepairItemOutcome, type RepairListing, type RepairPlan, type RepairScope } from './core.ts';
 
 const DOCS = 'docs/guides/repair.md#provenance';
 
 interface Selection { source_ids: string[]; slugs: string[]; include_ambiguous: boolean }
-interface PlannedPage { source_id: string; slug: string; id: number; revision: string; action: 'restore' | 'restamp'; planned: string; summary: string }
+interface PlannedPage { source_id: string; slug: string; id: number; revision: string; action: 'restore' | 'restamp' | 'first_ingest_projection'; planned: string; summary: string }
 interface ProvenanceItem extends RepairItem { page: PlannedPage; hash: string; includeAmbiguous: boolean; last: boolean }
 
 function previewCommand(scope: RepairScope, selection: Selection): string {
@@ -84,7 +85,7 @@ const segmented = async (engine: BrainEngine, pageId: number) =>
 async function scan(engine: BrainEngine, scope: RepairScope, selection: Selection) {
   const planned: PlannedPage[] = [];
   const listing: RepairListing[] = [];
-  const residuals: Record<string, number> = { restore: 0, restamp: 0, ambiguous: 0, needs_review: 0, local: 0, held: 0 };
+  const residuals: Record<string, number> = { restore: 0, restamp: 0, first_ingest_projection: 0, ambiguous: 0, needs_review: 0, local: 0, held: 0 };
   const managedBrain = await managedPersistenceEnabled(engine);
   for (const sourceId of scope.source_ids) {
     const drift = await scanProvenanceDrift(engine, sourceId, { limit: Number.MAX_SAFE_INTEGER, includeAmbiguous: selection.include_ambiguous, slugs: selection.slugs });
@@ -94,13 +95,31 @@ async function scan(engine: BrainEngine, scope: RepairScope, selection: Selectio
       const { verdict } = item;
       if (verdict.class === 'local') { residuals.local!++; listing.push({ item: label, class: 'local', detail: `the owner's own edit, never repaired; ${writerDetail(item)}` }); continue; }
       if (verdict.class === 'needs_review') { residuals.needs_review!++; listing.push({ item: label, class: 'needs_review', detail: `${verdict.reason}; edit the page by hand` }); continue; }
-      if (!verdict.restore) {
+      const editColumn = verdict.changes.find(change => change.key === 'source_kind');
+      const possibleFirstIngest = managedBrain && verdict.class === 'ambiguous' && !verdict.marker_lost && !verdict.marker_missing
+        && editColumn?.to === 'put_page' && (editColumn.from === 'mcp:edit_page' || editColumn.from === 'mcp:append_page')
+        && verdict.changes.some(change => change.key === 'ingested_via' && change.from === editColumn.from && change.to === 'put_page');
+      const first = possibleFirstIngest ? await firstIngestEvidence(engine, sourceId, item.slug) : null;
+      if (possibleFirstIngest && !first) {
+        residuals.needs_review!++;
+        listing.push({ item: label, class: 'needs_review', detail: 'a later edit channel conflicts with the first ingest; verify the creation receipt, full history and current checkout' });
+        continue;
+      }
+      if (!first && !verdict.restore) {
         residuals.ambiguous!++;
         listing.push({ item: label, class: 'ambiguous', detail: `no recorded writer; previewed with --include-ambiguous only; ${writerDetail(item)}` });
         continue;
       }
       const hold = holds.get(item.page_id);
       if (hold) { residuals.held!++; listing.push({ item: label, class: 'held', detail: heldDetail(hold) }); continue; }
+      if (first) {
+        const action = 'first_ingest_projection';
+        residuals[action]!++;
+        const summary = `restore the original put_page ingestion at ${first.first_at} from committed creation receipt ${first.birth_request}; preserve the file, revision and trust tier`;
+        planned.push({ source_id: sourceId, slug: item.slug, id: first.page_id, revision: first.revision, action, planned: first.planned, summary });
+        listing.push({ item: label, class: action, detail: summary });
+        continue;
+      }
       if (await segmented(engine, item.page_id)) {
         residuals.needs_review!++;
         listing.push({ item: label, class: 'needs_review', detail: 'the page stores its body in segments, which this repair does not rewrite; edit its frontmatter by hand' });
@@ -133,6 +152,10 @@ function item(page: PlannedPage, hash: string, includeAmbiguous: boolean, last: 
 async function stillPlanned(engine: BrainEngine, page: PlannedPage, includeAmbiguous: boolean): Promise<'planned' | 'done' | 'moved'> {
   const current = await readPageDrift(engine, page.source_id, page.slug, { includeAmbiguous });
   if (!current) return 'done';
+  if (page.action === 'first_ingest_projection') {
+    const proof = await firstIngestEvidence(engine, page.source_id, page.slug);
+    return proof?.planned === page.planned && current.page_id === page.id && current.revision === page.revision ? 'planned' : 'moved';
+  }
   if (current.page_id !== page.id || !current.verdict.restore) return 'moved';
   return current.revision === page.revision && plannedDigest(current) === page.planned ? 'planned' : 'moved';
 }
@@ -178,6 +201,10 @@ export const provenanceRepair: RepairHandler = {
       const hold = (await pageHolds(ctx.engine, page.source_id, [page])).get(page.id);
       if (hold) return { applied: false, outcome: 'held', reason: heldDetail(hold) };
       const input = { sourceId: page.source_id, slug: page.slug, expectedRevision: page.revision, confirmation: { via: 'preview_hash' as const }, config: ctx.config };
+      if (page.action === 'first_ingest_projection') {
+        await repairFirstIngestProjection(ctx.engine, { ...input, planned: page.planned });
+        return { applied: true, outcome: 'restored_first_ingest_projection' };
+      }
       const result = page.action === 'restamp' ? await repairPageMarker(ctx.engine, input)
         : await restorePageProvenance(ctx.engine, { ...input, planned: page.planned, includeAmbiguous });
       return { applied: true, outcome: page.action === 'restamp' ? 'restamped' : 'restored', detail: { tier: result.tier, prior_tier: result.prior_tier } };

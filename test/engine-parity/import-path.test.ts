@@ -90,6 +90,13 @@ describe('engine parity: import path guards', () => {
     return { isUuid: UUID.test(first ?? ''), stable: first === second };
   });
 
+  parityTest('firstIngestProjection never changes a page without a publication history', { methods: ['firstIngestProjection'] }, async engine => {
+    const preview = await engine.firstIngestProjection('default', 'notes/missing');
+    const apply = await engine.firstIngestProjection('default', 'notes/missing', 'unproven');
+    expect([preview, apply]).toEqual([null, null]);
+    return { preview, apply };
+  });
+
   parityTest('insertLocalWriterRow registers a writer once; readLocalWriterRow returns it, with or without the share lock', { methods: ['insertLocalWriterRow', 'readLocalWriterRow', 'transaction'] }, async (engine) => {
     const absent = await engine.readLocalWriterRow(WRITER);
     expect(absent).toBeUndefined();

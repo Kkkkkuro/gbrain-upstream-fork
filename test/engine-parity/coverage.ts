@@ -92,7 +92,7 @@ export const FAMILIES: Record<string, readonly string[]> = {
   withdrawal_pages: ['listSegmentedPages', 'invalidateWithdrawnPages'],
   // withdrawal_fence: the withdrawal check a prepared import runs on a malformed facts fence
   withdrawal_fence: ['hasWithdrawnFenceClaim'],
-  import_guards: ['readManagedModeRows', 'getSourceStrictness', 'readPersistenceBrainId', 'readLocalWriterRow', 'insertLocalWriterRow',
+  import_guards: ['firstIngestProjection', 'readManagedModeRows', 'getSourceStrictness', 'readPersistenceBrainId', 'readLocalWriterRow', 'insertLocalWriterRow',
     'readTransactionSettings', 'applyTransactionSettings', 'readLedgerSource', 'isFolderRestricted'],
   cycle_locks: ['acquireCycleLock', 'refreshCycleLock', 'releaseCycleLock', 'readCycleLocks', 'deleteCycleLock', 'deleteCycleLockIfStale'],
   raw_sql: ['runMigration', 'executeRaw', 'executeRawDirect', 'keywordBoundedRead'],
