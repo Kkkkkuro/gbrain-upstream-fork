@@ -7,6 +7,9 @@
  *    add … --yes)"), or names another revision.
  * 3. Real seams: the gbrain access rule CLI module on a repo-less PGLite brain.
  */
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runAccessRules } from '../src/commands/access-rules.ts';
@@ -28,6 +31,18 @@ async function printed(args: string[]): Promise<string> {
 }
 
 describe('access rule preview (GBRA-585)', () => {
+  test('a missing import file reports an actionable input error before applying a rule', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-rule-import-'));
+    try {
+      const before = await engine.executeRaw('SELECT count(*) AS n FROM access_rules');
+      await expect(runAccessRules(engine, 'rule', ['import', '--file', join(dir, 'missing.yml')], true))
+        .rejects.toMatchObject({ code: 'invalid_params', suggestion: expect.stringContaining('--file') });
+      expect(await engine.executeRaw('SELECT count(*) AS n FROM access_rules')).toEqual(before);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('the printed approve command carries the --expect the preview asks for, and running it applies', async () => {
     const preview = await printed(['rule', 'add', '--prefix', 'team/', '--readers', 'alice-example,bob-example']);
     const line = preview.split('\n').find(l => l.startsWith('Nothing written. To approve'))!;
