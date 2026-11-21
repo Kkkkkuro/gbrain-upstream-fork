@@ -352,6 +352,7 @@ function tierOf(reason: PgAccessReason): 'auto' | 'rewrite' | 'manual' {
     case 'db_missing':
     case 'no_url':
     case 'env_shadowed':
+    case 'storage_read_interrupted':
     case 'storage_corrupt':
     case 'tls_required_default':
     case 'unknown':
@@ -817,6 +818,7 @@ async function applyLadder(
     case 'db_missing':
     case 'no_url':
     case 'env_shadowed':
+    case 'storage_read_interrupted':
     case 'storage_corrupt':
     case 'tls_required_default':
     case 'unknown':

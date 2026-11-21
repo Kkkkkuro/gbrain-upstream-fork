@@ -68,6 +68,7 @@ export type PgAccessReason =
   | 'db_missing'          // 3D000 database does not exist
   | 'schema_missing'      // 42P01 / 42703 missing relation or column
   | 'pgvector_missing'    // vector extension absent
+  | 'storage_read_interrupted' // PostgreSQL reported EINTR while opening or reading a data file
   | 'storage_corrupt'     // XX000/XX001/XX002: torn TOAST value, catalog/tuple damage (#5216, #4738)
   | 'tls_required_default' // postgres_tls_required: gbrain's TLS default met a non-local server without TLS
   | 'unknown';
@@ -165,6 +166,8 @@ interface ReasonRow {
   /** Code-prefix matches (e.g. every 08xxx connection SQLSTATE). */
   codePrefixes?: string[];
   patterns?: RegExp[];
+  /** Restricts these message patterns to the named SQLSTATE. */
+  patternSqlstate?: string;
   /** Left out only on a row for a gbrain-coded error: its advice is that code's error-registry suggestion. */
   remediation?: string;
   /** E10: the same advice without Supabase specifics, used when the configured URL is not a Supabase host. */
@@ -186,6 +189,14 @@ const REASON_ROWS: ReadonlyArray<ReasonRow> = [
     reason: 'tls_required_default',
     transient: false,
     codes: ['postgres_tls_required'],
+  },
+  {
+    reason: 'storage_read_interrupted',
+    transient: false,
+    // PostgreSQL's errcode_for_file_access maps EINTR to XX000. The specific message distinguishes it from data corruption.
+    patternSqlstate: 'XX000',
+    patterns: [/^could not (?:open file|read block [0-9]+ in file) "(?:base|global|pg_tblspc)\/[^"\r\n]+": Interrupted system call$/i],
+    remediation: 'Check storage availability and the PostgreSQL log on the database host. Once a database read succeeds, inspect the original job or write receipt before resubmitting work.',
   },
   {
     reason: 'storage_corrupt',
@@ -407,7 +418,7 @@ export function classifyPgAccessError(err: unknown, ctx?: PgAccessContext): PgAc
     const codeHit =
       (code && row.codes?.includes(code)) ||
       (code && row.codePrefixes?.some((p) => code.startsWith(p)));
-    const patternHit = row.patterns?.some((re) => re.test(rawMessage));
+    const patternHit = (!row.patternSqlstate || code === row.patternSqlstate) && row.patterns?.some((re) => re.test(rawMessage));
     if (!codeHit && !patternHit) continue;
     return {
       reason: row.reason,

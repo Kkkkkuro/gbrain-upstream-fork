@@ -788,6 +788,7 @@ function dbParts(e: unknown, ctx: AgentErrorContext): EnvelopeParts | undefined 
   return {
     error: verb ? 'unavailable' : 'database_error', code: verb ? 'unavailable' : 'database_error', reason: d.reason,
     message: d.message, suggestion: `${formatDbAccessMarker(d)}. ${d.remediation} Run: gbrain db-repair`,
+    ...(d.reason === 'storage_read_interrupted' ? { why: d.remediation } : {}),
     fix: {
       argv: ['gbrain', 'db-repair'], consent: [], actor: 'agent',
       why: 'db-repair diagnoses the database connection without changing anything.', requires_exclusive: false,
