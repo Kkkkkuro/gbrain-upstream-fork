@@ -37,9 +37,13 @@ async function gitAsync(root: string, args: string[]): Promise<string | null> {
   return r.error ? null : r.stdout.trim() || null;
 }
 
-function mtime(path: string | null): number {
+function observationMtime(path: string | null): number {
   if (!path) return 0;
-  try { return statSync(path).mtimeMs; } catch { return 0; }
+  try {
+    const stat = statSync(path);
+    // A failed fetch may truncate FETCH_HEAD and give it a new mtime without observing any ref.
+    return stat.isFile() && stat.size > 0 ? stat.mtimeMs : 0;
+  } catch { return 0; }
 }
 
 /** Whether the checkout's branch tracks an upstream (a `git pull` would have something to refresh). */
@@ -53,8 +57,8 @@ export async function observeUpstream(root: string, syncedCommit: string | null)
   const ref = commit && await gitAsync(root, ['rev-parse', '--symbolic-full-name', '@{upstream}']);
   if (!commit || !ref) return null;
   const checkedMs = Math.max(
-    mtime(await gitAsync(root, ['rev-parse', '--path-format=absolute', '--git-path', 'FETCH_HEAD'])),
-    mtime(await gitAsync(root, ['rev-parse', '--path-format=absolute', '--git-path', `logs/${ref}`])),
+    observationMtime(await gitAsync(root, ['rev-parse', '--path-format=absolute', '--git-path', 'FETCH_HEAD'])),
+    observationMtime(await gitAsync(root, ['rev-parse', '--path-format=absolute', '--git-path', `logs/${ref}`])),
   );
   if (checkedMs === 0) return null;
   const count = syncedCommit ? await gitAsync(root, ['rev-list', '--count', `${syncedCommit}..${commit}`]) : null;

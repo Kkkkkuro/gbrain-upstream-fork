@@ -1,0 +1,1 @@
+- Sync freshness uses the last nonempty Git observation when a failed fetch leaves an empty FETCH_HEAD.
