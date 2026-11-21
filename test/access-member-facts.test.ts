@@ -127,6 +127,12 @@ for (const kind of testBackends()) {
       const [pageRow] = await engine.executeRaw<{ page_readers: string[]; compiled_truth: string }>('SELECT page_readers, compiled_truth FROM pages WHERE source_id = $1 AND slug = $2', [SRC, 'memory/members/alice-example']);
       expect(pageRow!.page_readers).toEqual(['member:alice-example']);
       expect(pageRow!.compiled_truth).toContain(CANARY.alice);
+      const [capture] = await engine.executeRaw<{ captured: string; submitted: Date | string }>(
+        `SELECT p.frontmatter->>'captured_at' AS captured, r.created_at AS submitted
+           FROM pages p JOIN persistence_requests r ON r.source_id = p.source_id AND r.slug = p.slug
+           WHERE p.source_id = $1 AND p.slug = $2 AND r.operation = 'remember' AND r.state = 'committed'
+           ORDER BY r.created_at LIMIT 1`, [SRC, 'memory/members/alice-example']);
+      expect(capture!.captured).toBe(new Date(capture!.submitted).toISOString());
       const acme = await engine.executeRaw<{ compiled_truth: string }>('SELECT compiled_truth FROM pages WHERE source_id = $1 AND slug = $2', [SRC, ACME]);
       expect(acme[0]!.compiled_truth).not.toContain(CANARY.alice);
     }, 60_000);

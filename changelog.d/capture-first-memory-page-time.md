@@ -1,0 +1,1 @@
+- The first memory capture now records its request timestamp in the generated member or shared memory page.

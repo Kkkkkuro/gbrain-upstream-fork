@@ -136,14 +136,19 @@ export function scopePageNotShared(sourceId: string): OperationError {
     { reason: 'scope_page_not_shared' });
 }
 
+// The persisted request time makes the first capture stable across deferred publication and retries.
+function captureFields(capturedAt?: Date): string[] {
+  return capturedAt ? [`captured_at: "${capturedAt.toISOString()}"`] : [];
+}
+
 /** The frontmatter of the scope page its first fact creates: no readers, so the source's read grant is its audience. */
-export function scopePageFrontmatter(): string {
-  return ['---', 'type: note', 'title: Scope memory', '---', ''].join('\n');
+export function scopePageFrontmatter(capturedAt?: Date): string {
+  return ['---', 'type: note', 'title: Scope memory', ...captureFields(capturedAt), '---', ''].join('\n');
 }
 
 /** The frontmatter of a member page its first fact creates: the member is its only reader. */
-export function memberPageFrontmatter(member: string): string {
-  return ['---', 'type: note', `title: Memory of ${member}`, 'readable_by:', `  - member:${member}`, '---', ''].join('\n');
+export function memberPageFrontmatter(member: string, capturedAt?: Date): string {
+  return ['---', 'type: note', `title: Memory of ${member}`, ...captureFields(capturedAt), 'readable_by:', `  - member:${member}`, '---', ''].join('\n');
 }
 
 /**
