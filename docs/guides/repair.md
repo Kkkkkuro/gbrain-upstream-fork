@@ -3280,7 +3280,7 @@ keeps the earlier revision.
 
 When the date is stated in verified evidence outside the claim, the host
 operator can supply `--evidence-file <path>` instead of selecting a bulk day.
-Use a JSON array. Each entry identifies a canonical fact row and its current
+Use a JSON array. Each entry identifies a fact and its current
 start and claim, and records the earlier start and the source that supports it.
 For example, an entry for the claim `Acme Example opened its showroom` has these fields:
 
@@ -3298,10 +3298,15 @@ For example, an entry for the claim `Acme Example opened its showroom` has these
 UTF-8, without an extra newline. Both timestamps use UTC, with seconds and
 optional milliseconds. The new date must be an earlier UTC day. The preview
 lists the evidence and selects only rows named in the file. If any entry is
-stale, outside the source, or lacks a matching canonical Facts row, the preview
-selects no changes. The manifest content and page revisions are bound to the
-approval hash. Apply the printed command after review. The repair only changes
-approved `valid_from` cells and keeps each claim, row and speaker.
+stale, outside the source, or lacks an eligible storage row, the preview
+selects no changes. On a source configured as Git-canonical, each approved
+fact must have a matching canonical Facts row. On a managed mixed source,
+the repair can also update a fact stored only in the database when the local
+CLI operator has source-wide write authority. The manifest, source identity
+and applicable page revisions are bound to the approval hash. Apply the
+printed command after review. The repair changes approved `valid_from`
+values and preserves the fact ID, claim, source and speaker. Database-only
+changes have a terminal write receipt and require database recovery.
 
 <a id="failed-writes"></a>
 ### Failed writes

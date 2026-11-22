@@ -8,7 +8,7 @@
  * finds nothing on a second preview.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
@@ -19,6 +19,9 @@ import { operationsByName } from '../src/core/operations.ts';
 import { parseFactsFence, renderFactsTable, type ParsedFact } from '../src/core/facts-fence.ts';
 import { claimDate } from '../src/core/facts/bulk-days.ts';
 import { parseMarkdown } from '../src/core/markdown.ts';
+import { prepareFactDateRepair, publishFactDateRepair } from '../src/core/persistence/fact-date-repair.ts';
+import { registerLocalWriterValue, withVerifiedLocalRegistration } from '../src/core/persistence/identity.ts';
+import { getWriteRequestById } from '../src/core/persistence/journal.ts';
 import { factBulkDatesCheck } from '../src/commands/doctor/checks/fact-bulk-dates.ts';
 import { runWaveChecks } from '../src/commands/doctor/wave-checks.ts';
 import { runRepairCommand } from '../src/commands/repair.ts';
@@ -171,6 +174,109 @@ for (const backend of testBackends()) {
         expect(actual.frontmatter).toEqual(expected.frontmatter);
         expect(actual.compiled_truth).toBe(expected.compiled_truth);
         expect(actual.timeline).toBe(expected.timeline);
+        expect((await cli()).affected).toBe(0);
+      }, { databaseUrl });
+    }, 240_000);
+
+    test('explicit local evidence journals a batch of unfenced dates and keeps IDs, provenance and files', async () => {
+      await managedBrain(async ({ engine, ctx, root }) => {
+        await putPage(ctx, ACME, page('Acme Example', 'company', [[1, 'Canonical fact', DAY]]));
+        const oldStart = `${DAY}T00:00:00.000Z`;
+        const corrected = '2025-03-14T14:05:09.125Z';
+        await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+        try {
+          await engine.executeRaw(`INSERT INTO facts (source_id, entity_slug, fact, kind, visibility, source, valid_from, attributed_to, source_window)
+             VALUES ('default', NULL, 'The publisher showed the showroom', 'fact', 'private', 'archive-a', $1::timestamptz, 'other', '{"source_quote":"Original exhibit"}'),
+                    ('default', $2, 'The publisher showed a model home', 'fact', 'private', 'archive-b', $1::timestamptz, 'other', '{"source_quote":"Original exhibit"}'),
+                    ('default', NULL, 'The observer shared a reaction', 'fact', 'private', 'unrelated', $1::timestamptz, 'other', '{}')`, [oldStart, ACME]);
+        } finally {
+          await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+        }
+        const rows = () => engine.executeRaw<Record<string, unknown>>(`SELECT to_jsonb(f) - 'last_write_principal_kind' - 'last_write_principal_id'
+          - 'last_write_request_id' - 'last_written_at' AS row, f.last_write_request_id AS latest_request FROM facts f
+          WHERE source_id='default' ORDER BY id`);
+        const before = await rows();
+        const originals = before.map(item => item.row as Record<string, unknown>);
+        const evidence = originals.filter(item => String(item.source).startsWith('archive')).map(item => ({
+          id: Number(item.id), claim_sha256: createHash('sha256').update(String(item.fact)).digest('hex'),
+          expected_valid_from: oldStart, valid_from: corrected, evidence: 'Synthetic dated original release',
+        }));
+        const input = join(root, 'unfenced-date-evidence.json');
+        const canonical = join(root, ACME + '.md');
+        const originalFile = readFileSync(canonical, 'utf8');
+        const args = ['fact-claim-dates', '--source', 'default', '--evidence-file', input, '--json'];
+        async function cli(extra: string[] = []) {
+          _resetCliExitVerdictForTests();
+          const lines: string[] = [];
+          const log = console.log;
+          console.log = (...parts: unknown[]) => { lines.push(parts.map(String).join(' ')); };
+          try { await withEnv({ GBRAIN_INTERACTIVE: '0', CI: '1' }, () => runRepairCommand(engine, [...args, ...extra])); }
+          finally { console.log = log; }
+          return JSON.parse(lines.join('\n')).results[0];
+        }
+        const receipts = () => engine.executeRaw<Record<string, unknown>>(`SELECT id,operation,request_id,state,slug,outcome FROM persistence_requests
+          WHERE operation='repair_fact_dates' ORDER BY id`);
+        writeFileSync(input, JSON.stringify([{ ...evidence[0]!, claim_sha256: '0'.repeat(64) }, evidence[1]]));
+        expect(await cli()).toMatchObject({ affected: 0, residuals: { evidence_fact_changed: 1 } });
+        writeFileSync(input, JSON.stringify(evidence));
+        await engine.executeRaw(`UPDATE sources SET config=config || '{"canonical":"git"}'::jsonb WHERE id='default'`);
+        expect(await cli()).toMatchObject({ affected: 0, residuals: { evidence_not_fenced: 2 } });
+        await engine.executeRaw(`UPDATE sources SET config=config - 'canonical' WHERE id='default'`);
+        const plan = await cli();
+        expect(plan).toMatchObject({ affected: 1, applied: 0, listing: [
+          { item: 'default', class: 'update_with_receipt' },
+          { class: 'external_evidence' }, { class: 'external_evidence' },
+        ] });
+        expect(await receipts()).toEqual([]);
+        expect(await rows()).toEqual(before);
+        const [source] = await engine.executeRaw<{ incarnation: string }>("SELECT incarnation::text FROM sources WHERE id='default'");
+        const approval = { brainId: (await engine.readPersistenceBrainId())!, sourceIncarnation: source!.incarnation, rows: evidence };
+        for (const unapproved of [{ ...ctx, remote: true }, { ...ctx, dryRun: true }, { ...ctx, sourceId: 'other' }]) {
+          await expect(publishFactDateRepair(unapproved, 'default', randomUUID(), approval))
+            .rejects.toMatchObject({ code: 'permission_denied' });
+        }
+        await expect(publishFactDateRepair(ctx, 'default', randomUUID(), { ...approval, brainId: randomUUID() }))
+          .rejects.toMatchObject({ code: 'revision_conflict' });
+        await expect(publishFactDateRepair(ctx, 'default', randomUUID(), { ...approval, sourceIncarnation: randomUUID() }))
+          .rejects.toMatchObject({ code: 'revision_conflict' });
+        const limited = { id: randomUUID(), lane: 'cli' as const, credential: randomUUID() };
+        await registerLocalWriterValue(engine, limited, { sourceIds: ['default'], scopes: ['write'],
+          operations: ['repair_fact_dates'], slugPrefixes: ['repairs/fact-dates/*'] });
+        await withVerifiedLocalRegistration(engine, limited, async () => {
+          await expect(publishFactDateRepair(ctx, 'default', randomUUID(), approval))
+            .rejects.toMatchObject({ code: 'permission_denied' });
+        });
+        expect(await receipts()).toEqual([]);
+        const result = await cli(['--apply', '--expect', plan.preview_hash, '--yes']);
+        expect(result).toMatchObject({ applied: 1, failed: [], outcome_items: [{ outcome: 'updated', detail: { facts: 2 } }] });
+        const [receipt] = await receipts();
+        expect(receipt).toMatchObject({ operation: 'repair_fact_dates', state: 'committed', outcome: { facts: 2, dates: evidence } });
+        const stored = (await getWriteRequestById(engine, String(receipt!.id)))!;
+        const prepared = prepareFactDateRepair(stored);
+        await engine.executeRaw(`UPDATE persistence_local_writers
+          SET grant_ceiling=jsonb_set(grant_ceiling, '{slugPrefixes}', '["repairs/fact-dates/*"]'::jsonb)
+          WHERE id=$1::uuid`, [stored.principal_id]);
+        try {
+          await expect(engine.transaction(tx => prepared.apply(tx))).rejects.toMatchObject({ code: 'permission_denied' });
+        } finally {
+          await engine.executeRaw(`UPDATE persistence_local_writers
+            SET grant_ceiling=jsonb_set(grant_ceiling, '{slugPrefixes}', 'null'::jsonb)
+            WHERE id=$1::uuid`, [stored.principal_id]);
+        }
+        expect(await engine.readPageSnapshot(String(receipt!.slug), { sourceId: 'default' })).toBeNull();
+        const after = await rows();
+        for (const [i, item] of after.entries()) {
+          const old = originals[i]!;
+          if (!evidence.some(entry => entry.id === Number(old.id))) {
+            expect(item).toEqual(before[i]!);
+            continue;
+          }
+          const actual = item.row as Record<string, unknown>;
+          expect(new Date(String(actual.valid_from)).toISOString()).toBe(corrected);
+          expect<Record<string, unknown>>({ ...actual, valid_from: old.valid_from }).toEqual(old);
+          expect(item.latest_request).toBe(receipt!.id);
+        }
+        expect(readFileSync(canonical, 'utf8')).toBe(originalFile);
         expect((await cli()).affected).toBe(0);
       }, { databaseUrl });
     }, 240_000);

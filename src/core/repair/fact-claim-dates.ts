@@ -18,7 +18,8 @@
  * (`gbrain repair split-facts`), it is stored in segments, or the rewritten fence would not read back as exactly the
  * planned rows. A row whose fence cell no longer reads the bulk day is counted `fence_mismatch`. A database-only fact
  * (no fence row) takes a direct valid_from update on an unmanaged brain; on a managed brain it is counted
- * `database_only_managed` and kept, because a managed write never changes a fact the canonical files do not hold.
+ * `database_only_managed` and kept in automatic discovery. Explicit operator evidence may correct these rows
+ * through the coordinator on a managed mixed source. Git-canonical sources still require a fence row.
  *
  * Explicit-only, preview-bound and destructive: the preview writes nothing, lists every page and database-only group
  * with its rows, and prints a hash over the pages' revisions, row numbers and new dates. `--apply --expect <hash> --yes`
@@ -29,7 +30,8 @@
 import { createHash } from 'node:crypto';
 import { shellQuote } from '../agent-output.ts';
 import type { BrainEngine } from '../engine.ts';
-import type { FactDateEvidenceFile } from './fact-date-evidence.ts';
+import type { FactDateEvidence, FactDateEvidenceFile } from './fact-date-evidence.ts';
+import { publishFactDateRepair, type UnfencedDateApproval } from '../persistence/fact-date-repair.ts';
 import type { Page } from '../types.ts';
 import { opError, OperationError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
@@ -50,13 +52,18 @@ const LISTED_ROWS = 5;
 type Section = 'compiled_truth' | 'timeline';
 interface PlannedRow { row: number; day: string; date: string; expectedStart?: string }
 interface PagePlan { source_id: string; slug: string; revision: string; section: Section; rows: PlannedRow[] }
-interface FactsPlan { source_id: string; entity_slug: string | null; rows: Array<{ id: number; valid_from: string; day: string; date: string }> }
+interface FactsPlan {
+  source_id: string;
+  entity_slug: string | null;
+  rows: Array<{ id: number; valid_from: string; day: string; date: string }>;
+  unfenced?: UnfencedDateApproval;
+}
 interface Selection { source_ids: string[]; day: string | null; evidenceDigest?: string }
 interface Approved { selection: Selection; page?: PagePlan; facts?: FactsPlan }
 interface ClaimItem extends RepairItem { approved: Approved; hash: string; last: boolean }
 
 interface FactRow { id: number | string; entity_slug: string | null; fact: string; row_num: number | string | null; source_markdown_slug: string | null;
-  valid_from: string; day: string; valid_until_day: string | null }
+  valid_from: string; valid_until: string | null; day: string; valid_until_day: string | null }
 
 interface Plan { hash: string; days: BulkFactDay[]; pages: PagePlan[]; facts: FactsPlan[]; residuals: Record<string, number>; listing: RepairListing[] }
 
@@ -133,12 +140,16 @@ async function buildPlan(engine: BrainEngine, scope: RepairScope, selection: Sel
   const days = selection.day || evidence ? [] : await findBulkFactDays(engine, [sourceId]);
   const dayList = selection.day ? [selection.day] : days.map(d => d.day);
   const managed = await managedPersistenceEnabled(engine);
+  const [source] = await engine.executeRaw<{ incarnation: string; canonical: string | null }>(
+    "SELECT incarnation::text,config->>'canonical' AS canonical FROM sources WHERE id=$1 AND NOT archived", [sourceId]);
+  const unfencedEvidence: FactDateEvidence[] = [];
   const residuals: Record<string, number> = {};
   const count = (key: string, n = 1) => { residuals[key] = (residuals[key] ?? 0) + n; };
   const byPage = new Map<string, Candidate[]>();
   const byEntity = new Map<string, FactsPlan>();
   const addPageRow = (slug: string, candidate: Candidate) => byPage.set(slug, [...(byPage.get(slug) ?? []), candidate]);
   const rows = await engine.executeRaw<FactRow>(`SELECT f.id, f.entity_slug, f.fact, f.row_num, f.source_markdown_slug, f.valid_from::text AS valid_from,
+      f.valid_until::text AS valid_until,
       to_char(f.valid_from AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
       to_char(f.valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS valid_until_day
     FROM facts f WHERE f.source_id = $1 AND f.expired_at IS NULL
@@ -171,13 +182,20 @@ async function buildPlan(engine: BrainEngine, scope: RepairScope, selection: Sel
         count('evidence_fact_changed');
         continue;
       }
-      if (row.row_num === null || !row.source_markdown_slug) { count('evidence_not_fenced'); continue; }
-      if (row.valid_until_day !== null && row.valid_until_day < wanted.valid_from.slice(0, 10)) {
+      const validUntil = row.valid_until === null ? null : cellInstant(row.valid_until);
+      if (row.valid_until !== null && (!validUntil || validUntil < wanted.valid_from)) {
         count('ends_before_claim_date');
         continue;
       }
-      addPageRow(row.source_markdown_slug, { row, day: wanted.expected_valid_from.slice(0, 10), date: wanted.valid_from,
-        expectedStart: wanted.expected_valid_from });
+      if (row.row_num !== null && row.source_markdown_slug) {
+        addPageRow(row.source_markdown_slug, { row, day: wanted.expected_valid_from.slice(0, 10), date: wanted.valid_from,
+          expectedStart: wanted.expected_valid_from });
+      } else if (managed && source && source.canonical !== 'git' && row.row_num === null && row.source_markdown_slug === null) {
+        unfencedEvidence.push(wanted);
+      } else {
+        count('evidence_not_fenced');
+        continue;
+      }
       evidenceListing.push({ item: `${sourceId}:fact ${wanted.id}`, class: 'external_evidence',
         detail: `${wanted.expected_valid_from} -> ${wanted.valid_from}; ${wanted.evidence}` });
     }
@@ -205,14 +223,19 @@ async function buildPlan(engine: BrainEngine, scope: RepairScope, selection: Sel
       detail: `${group.rows.length} database-only fact(s) take the date their claim states: ${group.rows.slice(0, LISTED_ROWS).map(row => `fact ${row.id} -> ${row.date}`).join(', ')}` });
   }
   if (evidence) {
+    if (source && unfencedEvidence.length && !Object.keys(residuals).length) {
+      facts.push({ source_id: sourceId, entity_slug: null, rows: [],
+        unfenced: { brainId: scope.brain_id, sourceIncarnation: source.incarnation, rows: unfencedEvidence } });
+      listing.push({ item: sourceId, class: 'update_with_receipt',
+        detail: `${unfencedEvidence.length} database-only fact(s) are eligible for a coordinated date correction.` });
+    }
     listing.push(...evidenceListing);
     if (Object.keys(residuals).length) {
       listing.push({ item: sourceId, class: 'evidence_set_incomplete', detail: 'The evidence list has unmatched rows; the preview selected no changes.' });
       pages.length = 0;
     }
   }
-  const [brain] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id = $1', [sourceId]);
-  const hash = previewHash({ kind: 'fact-claim-dates-v1', brain_id: scope.brain_id, source: { id: sourceId, incarnation: brain?.incarnation ?? null }, selection,
+  const hash = previewHash({ kind: 'fact-claim-dates-v1', brain_id: scope.brain_id, source: { id: sourceId, incarnation: source?.incarnation ?? null }, selection,
     days: dayList, pages: pages.map(({ slug, revision, section, rows }) => ({ slug, revision, section, rows })), facts });
   return { hash, days, pages, facts, residuals, listing };
 }
@@ -226,7 +249,7 @@ function dayWarnings(plan: Plan, selection: Selection): string[] {
 
 function item(approved: Approved, index: number, hash: string, last: boolean): ClaimItem {
   const slug = approved.page?.slug ?? approved.facts?.entity_slug ?? '(no entity)';
-  const rows = approved.page?.rows.length ?? approved.facts?.rows.length ?? 0;
+  const rows = approved.page?.rows.length ?? approved.facts?.unfenced?.rows.length ?? approved.facts?.rows.length ?? 0;
   return { cursor: { phase: 1, id: index }, source_id: (approved.page ?? approved.facts)!.source_id, slug, chars: 0,
     action: approved.page ? `move ${rows} fence row(s) to their claim date` : `move ${rows} database-only fact(s) to their claim date`, approved, hash, last };
 }
@@ -263,7 +286,8 @@ export const factClaimDatesRepair: RepairHandler = {
     const approved = await loadApprovedSet<Approved>(engine, { command: 'fact-claim-dates', hash: opts.expect, previewCommand: command,
       emptyHash: async () => (fresh ?? await buildPlan(engine, scope, selection, evidence)).hash });
     if (approved.items.some(entry => entry.selection.day !== selection.day || entry.selection.evidenceDigest !== selection.evidenceDigest ||
-        entry.selection.source_ids.join('\u0000') !== selection.source_ids.join('\u0000'))) {
+        entry.selection.source_ids.join('\u0000') !== selection.source_ids.join('\u0000') ||
+        (entry.facts?.unfenced && entry.facts.unfenced.brainId !== scope.brain_id))) {
       throw previewChangedError(opts.expect, command);
     }
     return { items: approved.items.map((entry, index) => item(entry, index, opts.expect!, index === approved.items.length - 1)).filter(entry => afterCursor(entry.cursor, after)),
@@ -271,7 +295,13 @@ export const factClaimDatesRepair: RepairHandler = {
   },
   async apply(ctx, entry): Promise<RepairItemOutcome> {
     const { approved, hash, last } = entry as ClaimItem;
-    const outcome = approved.page ? await movePage(ctx, entry, approved.page) : await moveFacts(ctx.engine, approved.facts!);
+    let outcome: RepairItemOutcome;
+    if (approved.page) outcome = await movePage(ctx, entry, approved.page);
+    else if (approved.facts?.unfenced) {
+      const requestId = await repairRequestId(ctx, 'fact-claim-dates', entry, hash);
+      const result = await publishFactDateRepair(ctx, entry.source_id, requestId, approved.facts.unfenced);
+      outcome = { applied: true, outcome: 'updated', detail: { facts: result.facts, request_id: requestId } };
+    } else outcome = await moveFacts(ctx.engine, approved.facts!);
     if (last) await clearApprovedSet(ctx.engine, { command: 'fact-claim-dates', hash });
     return outcome;
   },
